@@ -1,0 +1,6 @@
+[theme]
+primaryColor="#f54f2b"         # cor de destaque (botões, sliders)
+backgroundColor="#ffffff"      # fundo
+secondaryBackgroundColor="#f4f6fb"  # cards/painel
+textColor="#0b245c"
+font="sans serif"
