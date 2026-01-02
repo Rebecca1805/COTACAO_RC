@@ -681,7 +681,7 @@ def gerar_pdf_cotacao(cot_row, itens_df, show_prices=True):
 
     pdf.ln(5)
     pdf.set_font("Arial", "", 8)
-    pdf.cell(0, 8, "Desenvolvido por beccai.com.br", ln=True, align="R")
+    pdf.cell(0, 8, "Desenvolvido por www.beccai.com.br", ln=True, align="R")
 
     try:
         out = pdf.output(dest="S")
@@ -1410,6 +1410,19 @@ def pagina_cliente():
         st.session_state['cliente_logado'] = None
         st.rerun()
 
+    # Footer com informações de contato
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("""
+    <small style='color: white; font-size: 10px; opacity: 0.7;'>
+    **Contato e Suporte:**<br>
+    📧 atendimento@beccai.com.br<br>
+    📞 (11) 95451.9325<br>
+    💻 Desenvolvido por www.beccai.com.br<br>
+    ---<br>
+    **Versão 1.0** | Janeiro 2026
+    </small>
+    """, unsafe_allow_html=True)
+
     if menu == "Nova Cotação":
         pagina_nova_cotacao(cliente)
     elif menu == "Meus Pedidos":
@@ -1499,6 +1512,19 @@ def pagina_representante():
     if st.sidebar.button("Sair"):
         st.session_state['representante_logado'] = None
         st.rerun()
+
+    # Footer com informações de contato
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("""
+    <small style='color: white; font-size: 10px; opacity: 0.7;'>
+    **Contato e Suporte:**<br>
+    📧 atendimento@beccai.com.br<br>
+    📞 (11) 95451.9325<br>
+    💻 Desenvolvido por www.beccai.com.br<br>
+    ---<br>
+    **Versão 1.0** | Janeiro 2026
+    </small>
+    """, unsafe_allow_html=True)
 
     if menu == "Dashboard":
         st.title("📊 Dashboard")
