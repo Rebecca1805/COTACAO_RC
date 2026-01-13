@@ -2,10 +2,7 @@ streamlit
 pandas
 supabase
 python-dotenv
-streamlit
-streamlit-authenticator
 bcrypt
-pandas
 openpyxl
 fpdf
 unidecode
