@@ -1,7 +1,0 @@
-id,cliente_nome,cliente_telefone,representante,status,data,forma_recebimento,total,total_original,desconto_percentual
-7491affc,Loureiro,15999997777,,EM NEGOCIACAO,2025-12-03 12:55,Retirada no centro de distribuição,4507.7,4507.7,0.0
-a5a210e7,Loureiro,15999997777,,PENDENTE,2025-12-03 13:23,Entrega no endereço,565.3900000000001,565.3900000000001,0.0
-bdccf0a5,Loureiro,15999997777,,PENDENTE,2025-12-03 14:38,Entrega no endereço,38.36,38.36,0.0
-a77f51d5,Loureiro,15999997777,,PENDENTE,2025-12-03 14:39,Entrega no endereço,38.36,38.36,0.0
-36d22139,Loureiro,15999997777,,APROVADA,2025-12-03 14:49,Retirada no centro de distribuição,13500.18,13540.8,0.3
-LOUR20251203150328,Loureiro,15999997777,,PENDENTE,2025-12-03 15:03,Entrega no endereço,416.48,416.6,0.03
