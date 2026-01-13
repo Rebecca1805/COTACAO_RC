@@ -1,94 +1,71 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 import re
 from fpdf import FPDF
 import bcrypt
-import csv
-import secrets
-import string
-import shutil
-from unidecode import unidecode
+from supabase import create_client, Client
 
-# ========================= 
-# CONFIGURAÇÕES INICIAIS
-# ========================= 
-BASE_DIR = "data"
-AUTH_DIR = "auth"
-AUTH_CLIENTES_PATH = os.path.join(AUTH_DIR, "usuarios_clientes.csv")
-AUTH_REPRESENTANTES_PATH = os.path.join(AUTH_DIR, "usuarios_representantes.csv")
+# Adicione isso logo após os imports
+def data_brasil(data_iso):
+    """Converte string ISO ou datetime UTC para string formatada BR (-3h)"""
+    if not data_iso:
+        return ""
+    if isinstance(data_iso, str):
+        try:
+            dt = pd.to_datetime(data_iso)
+        except:
+            return data_iso
+    else:
+        dt = data_iso
+    
+    # Ajuste manual de -3 horas (simulando Brasília)
+    if dt.tzinfo:
+        dt = dt.tz_convert('America/Sao_Paulo') if 'tz_convert' in dir(dt.dt) else dt - pd.Timedelta(hours=3)
+        # Se vier com timezone do pandas, removemos para ficar naive local
+        if hasattr(dt, 'tz_localize'):
+            dt = dt.tz_localize(None)
+    else:
+        # Se não tem timezone, assumimos que é UTC e subtraímos 3
+        dt = dt - pd.Timedelta(hours=3)
+        
+    return dt
 
-os.makedirs(BASE_DIR, exist_ok=True)
-os.makedirs(AUTH_DIR, exist_ok=True)
+# =====================================================================
+# CONFIGURAÇÃO DO SUPABASE
+# =====================================================================
 
-# ========================= 
-# FUNÇÕES AUXILIARES DE CAMINHO
-# ========================= 
-def get_representante_dir(username_rep):
-    """Retorna o diretório específico do representante"""
-    return os.path.join(BASE_DIR, f"rep_{username_rep}")
+try:
+    supabase_url = st.secrets["SUPABASE_URL"]
+    
+    # Usar service_role para operações administrativas (bypass RLS)
+    if "SUPABASE_SERVICE_KEY" in st.secrets:
+        supabase_key = st.secrets["SUPABASE_SERVICE_KEY"]
+    else:
+        supabase_key = st.secrets["SUPABASE_KEY"]
+    
+    supabase: Client = create_client(supabase_url, supabase_key)
+except Exception as e:
+    st.error(f"Erro ao conectar com Supabase. Verifique as credenciais em .streamlit/secrets.toml: {e}")
+    st.stop()
 
-def get_clientes_path(username_rep):
-    """Retorna caminho do arquivo de clientes do representante"""
-    return os.path.join(get_representante_dir(username_rep), "clientes.xlsx")
+# =====================================================================
+# CONSTANTES E CONFIGURAÇÕES
+# =====================================================================
 
-def get_tabela_path(username_rep):
-    """Retorna caminho da tabela de preços do representante"""
-    return os.path.join(get_representante_dir(username_rep), "tabela_precos.csv")
+TOKEN_ADMIN = "ADMIN123"  # Token para cadastro de novos representantes
 
-def get_cotacoes_path(username_rep):
-    """Retorna caminho do arquivo de cotações do representante"""
-    return os.path.join(get_representante_dir(username_rep), "cotacoes.csv")
+# =====================================================================
+# ESTILOS CSS
+# =====================================================================
 
-def get_itens_cotacao_path(username_rep):
-    """Retorna caminho do arquivo de itens de cotação do representante"""
-    return os.path.join(get_representante_dir(username_rep), "itens_cotacao.csv")
-
-def inicializar_estrutura_representante(username_rep):
-    """Cria a estrutura de pastas e arquivos para um novo representante"""
-    rep_dir = get_representante_dir(username_rep)
-    os.makedirs(rep_dir, exist_ok=True)
-
-    # Cria arquivo de clientes vazio se não existir
-    clientes_path = get_clientes_path(username_rep)
-    if not os.path.exists(clientes_path):
-        df_clientes = pd.DataFrame(columns=[
-            "NOME", "CNPJ", "TELEFONE", "CIDADE", "DISTANCIA", 
-            "COLUNA_PRECO", "VISUALIZA_PRECO"
-        ])
-        df_clientes.to_excel(clientes_path, index=False)
-
-    # Cria arquivo de cotações vazio se não existir
-    cotacoes_path = get_cotacoes_path(username_rep)
-    if not os.path.exists(cotacoes_path):
-        df_cotacoes = pd.DataFrame(columns=[
-            "id", "cliente_nome", "cliente_telefone", "representante",
-            "status", "data", "forma_recebimento", "total_original",
-            "desconto_percentual", "total"
-        ])
-        df_cotacoes.to_csv(cotacoes_path, index=False)
-
-    # Cria arquivo de itens de cotação vazio se não existir
-    itens_path = get_itens_cotacao_path(username_rep)
-    if not os.path.exists(itens_path):
-        df_itens = pd.DataFrame(columns=[
-            "id_cotacao", "codigo", "produto", "unidade", "quantidade",
-            "preco_retira", "preco_final", "subtotal_retira", "subtotal_final"
-        ])
-        df_itens.to_csv(itens_path, index=False)
-
-# ========================= 
-# ESTILO LOCAL
-# ========================= 
 def local_css():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Gilroy:wght@400;600;700&family=Thasadith:wght@400;700&display=swap');
     
-    * {
-        font-family: 'Gilroy', sans-serif;
-    }
+    * { font-family: 'Gilroy', sans-serif; }
     
     .main-header {
         text-align: center;
@@ -133,12 +110,13 @@ def local_css():
         color: white;
     }
     
-    .stSidebar .stRadio label, .stSidebar .stSelectbox label, .stSidebar .stButton button, .stSidebar h1, .stSidebar h2, .stSidebar p {
+    .stSidebar .stRadio label, .stSidebar .stSelectbox label, 
+    .stSidebar .stButton button, .stSidebar h1, .stSidebar h2, .stSidebar p {
         color: white !important;
         font-family: 'Gilroy', sans-serif;
     }
     
-    .stSidebar .stRadio div[role="radiogroup"] label, .stSidebar .stSelectbox div label {
+    .stSidebar .stRadio div[role=radiogroup] label, .stSidebar .stSelectbox div label {
         color: white !important;
     }
     
@@ -208,238 +186,15 @@ def local_css():
     </style>
     """, unsafe_allow_html=True)
 
-# ========================= 
-# FUNÇÕES DE AUTENTICAÇÃO
-# ========================= 
-def init_auth_files():
-    """Cria arquivos de autenticação se não existirem"""
-    if not os.path.exists(AUTH_CLIENTES_PATH):
-        with open(AUTH_CLIENTES_PATH, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['username', 'nome', 'senha_hash', 'cnpj', 'telefone', 'representante_id'])
+# =====================================================================
+# FUNÇÕES AUXILIARES
+# =====================================================================
 
-    if not os.path.exists(AUTH_REPRESENTANTES_PATH):
-        with open(AUTH_REPRESENTANTES_PATH, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['username', 'nome', 'senha_hash', 'email'])
-
-def hash_senha(senha):
-    """Gera hash da senha"""
-    return bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def verificar_senha(senha, senha_hash):
-    """Verifica se a senha está correta"""
-    try:
-        return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
-    except (ValueError, AttributeError) as e:
-        st.error(f"Erro ao verificar senha: {e}")
-        return False
-
-def load_usuarios_clientes():
-    """Carrega usuários clientes do CSV"""
-    if not os.path.exists(AUTH_CLIENTES_PATH):
-        init_auth_files()
-        return pd.DataFrame(columns=['username', 'nome', 'senha_hash', 'cnpj', 'telefone', 'representante_id'])
-
-    df = pd.read_csv(AUTH_CLIENTES_PATH, dtype=str)
-    rename_map = {
-        "usuario": "username",
-        "usuário": "username",
-    }
-    df = df.rename(columns={c: rename_map.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns})
-
-    for col in ['username', 'nome', 'senha_hash', 'cnpj', 'telefone', 'representante_id']:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[['username', 'nome', 'senha_hash', 'cnpj', 'telefone', 'representante_id']]
-
-def load_usuarios_representantes():
-    """Carrega usuários representantes do CSV"""
-    if not os.path.exists(AUTH_REPRESENTANTES_PATH):
-        init_auth_files()
-        return pd.DataFrame(columns=['username', 'nome', 'senha_hash', 'email'])
-
-    df = pd.read_csv(AUTH_REPRESENTANTES_PATH, dtype=str)
-    rename_map = {
-        "usuario": "username",
-        "usuário": "username",
-    }
-    df = df.rename(columns={c: rename_map.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns})
-
-    for col in ['username', 'nome', 'senha_hash', 'email']:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[['username', 'nome', 'senha_hash', 'email']]
-
-def salvar_usuario_cliente(username, nome, senha, cnpj, telefone, representante_id):
-    """Adiciona novo usuário cliente"""
-    usuarios = load_usuarios_clientes()
-    if username in usuarios['username'].values:
-        return False, "Username já cadastrado"
-
-    novo_usuario = {
-        'username': username,
-        'nome': nome,
-        'senha_hash': hash_senha(senha),
-        'cnpj': cnpj,
-        'telefone': telefone,
-        'representante_id': representante_id
-    }
-    usuarios = pd.concat([usuarios, pd.DataFrame([novo_usuario])], ignore_index=True)
-    usuarios.to_csv(AUTH_CLIENTES_PATH, index=False)
-    return True, "Cliente cadastrado com sucesso!"
-
-def autenticar_cliente(username, senha):
-    """Autentica cliente e retorna seus dados"""
-    usuarios = load_usuarios_clientes()
-    usuario = usuarios[usuarios['username'] == username]
-
-    if usuario.empty:
-        return None, "Usuário não encontrado"
-
-    usuario = usuario.iloc[0]
-    if verificar_senha(senha, usuario['senha_hash']):
-        return usuario, "Login realizado com sucesso"
-
-    return None, "Senha incorreta"
-
-def salvar_usuario_representante(username, nome, senha, email):
-    """Adiciona novo usuário representante"""
-    usuarios = load_usuarios_representantes()
-    if username in usuarios['username'].values:
-        return False, "Username já cadastrado"
-
-    novo_usuario = {
-        'username': username,
-        'nome': nome,
-        'senha_hash': hash_senha(senha),
-        'email': email
-    }
-    usuarios = pd.concat([usuarios, pd.DataFrame([novo_usuario])], ignore_index=True)
-    usuarios.to_csv(AUTH_REPRESENTANTES_PATH, index=False)
-
-    # Inicializa estrutura de pastas para o novo representante
-    inicializar_estrutura_representante(username)
-
-    return True, "Representante cadastrado!"
-
-def autenticar_representante(username, senha):
-    """Autentica representante"""
-    usuarios = load_usuarios_representantes()
-    usuario = usuarios[usuarios['username'] == username]
-
-    if usuario.empty:
-        return None, "Usuário não encontrado"
-
-    usuario = usuario.iloc[0]
-    if verificar_senha(senha, usuario['senha_hash']):
-        return usuario, "Login realizado"
-
-    return None, "Senha incorreta"
-
-def resetar_senha_cliente(username):
-    """Reseta senha do cliente e gera senha temporária"""
-    usuarios = load_usuarios_clientes()
-    if username not in usuarios['username'].values:
-        return False, None, "Usuário não encontrado"
-
-    caracteres = string.ascii_letters + string.digits
-    senha_temp = ''.join(secrets.choice(caracteres) for _ in range(8))
-
-    usuarios.loc[usuarios['username'] == username, 'senha_hash'] = hash_senha(senha_temp)
-    usuarios.to_csv(AUTH_CLIENTES_PATH, index=False)
-
-    return True, senha_temp, "Senha resetada com sucesso!"
-
-# ========================= 
-# FUNÇÕES DE CARGA DE DADOS
-# ========================= 
-def load_clientes(username_rep):
-    """Lê a planilha de clientes do representante"""
-    clientes_path = get_clientes_path(username_rep)
-
-    if not os.path.exists(clientes_path):
-        inicializar_estrutura_representante(username_rep)
-
-    df = pd.read_excel(clientes_path)
-    df = df[df["NOME"].notna()].copy()
-    df.columns = [str(c).strip().upper() for c in df.columns]
-
-    if "CNPJ" in df.columns:
-        df["CNPJ"] = df["CNPJ"].fillna("").astype(str)
-        df["CNPJ"] = df["CNPJ"].apply(lambda x: x.split('.')[0] if '.' in x else x)
-
-    if "TELEFONE" in df.columns:
-        df["TELEFONE"] = df["TELEFONE"].fillna("").astype(str)
-        df["TELEFONE"] = df["TELEFONE"].apply(lambda x: x.split('.')[0] if '.' in x else x)
-
-    def _map_preco_from_dist(row):
-        if "DISTANCIA" in row and pd.notna(row["DISTANCIA"]):
-            s = str(row["DISTANCIA"]).strip()
-            if s.lower().startswith("preco"):
-                return s.replace(" ", "")
-            digits = re.sub(r"\D", "", s)
-            if digits:
-                try:
-                    d = int(digits)
-                except ValueError:
-                    return str(row.get("COLUNA_PRECO", "Preco100a199km")).replace(" ", "")
-                if d <= 199:
-                    return "Preco100a199km"
-                if d <= 299:
-                    return "Preco200a299km"
-                if d <= 399:
-                    return "Preco300a399km"
-                if d <= 499:
-                    return "PrecoAcima400km"
-                if d <= 599:
-                    return "PrecoAcima500km"
-                return "PrecoAcima600km"
-        return str(row.get("COLUNA_PRECO", "Preco100a199km")).replace(" ", "")
-
-    if "DISTANCIA" in df.columns:
-        df["COLUNA_PRECO"] = df.apply(_map_preco_from_dist, axis=1)
-    else:
-        df["COLUNA_PRECO"] = "Preco100a199km"
-
-    if "VISUALIZA_PRECO" not in df.columns:
-        df["VISUALIZA_PRECO"] = True
-    else:
-        def _parse_bool(v):
-            s = str(v).strip().lower()
-            if s in ("1", "true", "sim", "yes", "y"):
-                return True
-            return False
-        df["VISUALIZA_PRECO"] = df["VISUALIZA_PRECO"].apply(_parse_bool)
-
-    return df
-
-def salvar_clientes_df(df, username_rep):
-    """Salva o DataFrame de clientes do representante"""
-    df_to_save = df.copy()
-    df_to_save.columns = [str(c).upper() for c in df_to_save.columns]
-
-    if "VISUALIZA_PRECO" in df_to_save.columns:
-        df_to_save["VISUALIZA_PRECO"] = df_to_save["VISUALIZA_PRECO"].apply(
-            lambda v: "sim" if bool(v) else "0"
-        )
-
-    clientes_path = get_clientes_path(username_rep)
-    df_to_save.to_excel(clientes_path, index=False)
-    st.success("Clientes atualizados com sucesso!")
-
-def load_tabela_geral(username_rep):
-    """Lê a tabela geral de produtos do representante"""
-    tabela_path = get_tabela_path(username_rep)
-
-    if not os.path.exists(tabela_path):
-        return pd.DataFrame()
-
-    df = pd.read_csv(tabela_path, sep=",", encoding="utf-8", dtype=str)
-    df.columns = [str(c).strip().replace(" ", "") for c in df.columns]
-    return df
+def so_digitos(valor):
+    """Remove tudo que não for número"""
+    if pd.isna(valor):
+        return ""
+    return re.sub(r'\D', '', str(valor))
 
 def parse_preco(valor):
     """Converte string tipo '18,14' em float 18.14"""
@@ -449,679 +204,1493 @@ def parse_preco(valor):
     if not s:
         return None
     try:
-        s = s.replace(".", "").replace(",", ".")
+        s = s.replace('.', '').replace(',', '.')
         return float(s)
     except (ValueError, AttributeError):
         return None
 
-def get_preco_entrega(cliente_row, produto_row):
-    """Preço com frete, usando a coluna da faixa do cliente"""
-    if "COLUNA_PRECO" in cliente_row.index:
-        coluna_preco = str(cliente_row["COLUNA_PRECO"]).replace(" ", "")
-    elif "coluna_preco" in cliente_row.index:
-        coluna_preco = str(cliente_row["coluna_preco"]).replace(" ", "")
-    else:
-        return None
+# =====================================================================
+# FUNÇÕES DE AUTENTICAÇÃO
+# =====================================================================
 
-    if coluna_preco not in produto_row.index:
-        return None
+def hash_senha(senha):
+    """Gera hash da senha com bcrypt"""
+    return bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-    return parse_preco(produto_row[coluna_preco])
-
-def get_preco_retira(produto_row):
-    """Preço para retirada (coluna 'Retira')"""
-    if "Retira" not in produto_row.index:
-        return None
-    return parse_preco(produto_row["Retira"])
-
-def so_digitos(valor):
-    """Remove tudo que não for número"""
-    if pd.isna(valor):
-        return ""
-    return re.sub(r"\D", "", str(valor))
-
-def cliente_pode_ver_preco(cliente_row):
-    """Retorna True/False se o cliente pode visualizar os preços"""
+def verificar_senha(senha, senha_hash):
+    """Verifica se a senha está correta"""
     try:
-        return bool(cliente_row.get("VISUALIZA_PRECO", True))
-    except Exception:
+        return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
+    except (ValueError, AttributeError) as e:
+        return False
+
+# ---------------------------------------------------------------------
+# REPRESENTANTE - Autenticação com Supabase Auth
+# ---------------------------------------------------------------------
+
+def autenticar_representante(email, senha):
+    """
+    Autentica representante usando Supabase Auth
+    Retorna: (dados_representante, mensagem) ou (None, mensagem_erro)
+    """
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": senha
+        })
+        
+        user_id = response.user.id
+        rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
+        
+        return rep_data.data, "Login realizado com sucesso!"
+    
+    except Exception as e:
+        return None, f"Usuário ou senha incorretos"
+
+def cadastrar_representante(nome, email, senha, telefone):
+    """
+    Cadastra novo representante
+    1. Cria usuário no Supabase Auth
+    2. Insere linha na tabela representantes
+    """
+    try:
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": senha
+        })
+        
+        user_id = response.user.id
+        
+        supabase.table('representantes').insert({
+            'id': user_id,
+            'nome': nome,
+            'email': email,
+            'telefone': telefone
+        }).execute()
+        
+        return True, "Representante cadastrado com sucesso!"
+    
+    except Exception as e:
+        return False, f"Erro ao cadastrar: {str(e)}"
+
+# ---------------------------------------------------------------------
+# CLIENTE - Autenticação por CNPJ/Telefone
+# ---------------------------------------------------------------------
+
+def autenticar_cliente(cnpj_ou_telefone, senha):
+    """
+    Busca cliente por CNPJ ou telefone no banco
+    Valida senha com bcrypt
+    Retorna: (dados_cliente, mensagem) ou (None, mensagem_erro)
+    """
+    identificador = so_digitos(cnpj_ou_telefone)
+    
+    try:
+        response = supabase.table('clientes').select('*').or_(
+            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
+        ).execute()
+        
+        if not response.data:
+            return None, "Cliente não encontrado"
+        
+        cliente = response.data[0]
+        
+        if not cliente.get('senha_hash'):
+            return None, "Cliente ainda não criou senha. Use 'Primeiro Acesso'"
+        
+        if verificar_senha(senha, cliente['senha_hash']):
+            return cliente, "Login realizado com sucesso!"
+        else:
+            return None, "Senha incorreta"
+    
+    except Exception as e:
+        return None, f"Erro no login: {str(e)}"
+
+def buscar_cliente_para_cadastro(cnpj_ou_telefone):
+    """
+    Busca cliente sem senha na base (para primeiro acesso)
+    Retorna: (cliente, representante_id) ou (None, None)
+    """
+    identificador = so_digitos(cnpj_ou_telefone)
+    
+    try:
+        response = supabase.table('clientes').select('*').or_(
+            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
+        ).execute()
+        
+        if not response.data:
+            return None, None
+        
+        cliente = response.data[0]
+        return cliente, cliente['representante_id']
+    
+    except Exception as e:
+        return None, None
+
+def criar_senha_cliente(cliente_id, senha):
+    """Atualiza cliente com senha hash"""
+    try:
+        supabase.table('clientes').update({
+            'senha_hash': hash_senha(senha)
+        }).eq('id', cliente_id).execute()
+        
+        return True, "Conta criada com sucesso!"
+    
+    except Exception as e:
+        return False, f"Erro ao criar senha: {str(e)}"
+
+# =====================================================================
+# FUNÇÕES DE DADOS - CLIENTES
+# =====================================================================
+
+def carregar_clientes(representante_id):
+    """Carrega clientes do representante"""
+    try:
+        response = supabase.table('clientes').select('*').eq('representante_id', representante_id).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erro ao carregar clientes: {e}")
+        return pd.DataFrame()
+
+def atualizar_visualiza_preco(cliente_id, pode_ver):
+    """Atualiza flag de visualização de preço do cliente"""
+    try:
+        supabase.table('clientes').update({
+            'visualiza_preco': pode_ver
+        }).eq('id', cliente_id).execute()
         return True
+    except Exception as e:
+        st.error(f"Erro ao atualizar: {e}")
+        return False
 
-# ========================= 
-# FUNÇÕES DE ARMAZENAMENTO
-# ========================= 
-def load_cotacoes(username_rep):
+def upload_clientes_excel(arquivo, representante_id):
+    """
+    Lê Excel ou CSV de clientes e faz upsert no banco usando ID para evitar conflitos
+    """
+    try:
+        # 0. BUSCAR CLIENTES EXISTENTES (Para resolver conflitos de ID)
+        # Precisamos saber o ID de quem já está cadastrado para forçar atualização
+        existing_df = carregar_clientes(representante_id)
+        map_cnpj = {}
+        map_tel = {}
+        
+        if not existing_df.empty:
+            # Cria mapas de busca: CNPJ -> ID e Telefone -> ID
+            # Garante que estamos comparando apenas números limpos
+            if 'cnpj' in existing_df.columns:
+                for _, row in existing_df.iterrows():
+                    c_limpo = so_digitos(str(row['cnpj']))
+                    if c_limpo: map_cnpj[c_limpo] = row['id']
+                    
+            if 'telefone' in existing_df.columns:
+                for _, row in existing_df.iterrows():
+                    t_limpo = so_digitos(str(row['telefone']))
+                    if t_limpo: map_tel[t_limpo] = row['id']
+
+        # 1. Ler arquivo
+        nome_arquivo = arquivo.name.lower()
+        if nome_arquivo.endswith('.csv'):
+            df = pd.read_csv(arquivo, dtype=str)
+        else:
+            df = pd.read_excel(arquivo, dtype=str)
+        
+        # 2. Normalizar cabeçalhos
+        df.columns = [str(c).strip().upper().replace('_', '').replace(' ', '') for c in df.columns]
+        
+        # 3. Validar
+        if 'NOME' not in df.columns:
+            st.error("❌ O arquivo não possui a coluna 'NOME'. Verifique o cabeçalho.")
+            return
+
+        df = df[df['NOME'].notna()].copy()
+        
+        if df.empty:
+            st.warning("⚠️ O arquivo parece vazio.")
+            return
+            
+        clientes = []
+        count_sem_doc = 0
+        count_atualizados = 0
+        count_novos = 0
+        
+        for _, row in df.iterrows():
+            
+            # --- TRATAMENTO DE DADOS ---
+            cnpj_limpo = so_digitos(str(row.get('CNPJ', '')))
+            tel_limpo = so_digitos(str(row.get('TELEFONE', '')))
+            
+            # --- LÓGICA DE DETECÇÃO DE ID (O Segredo para não dar erro) ---
+            cliente_id = None
+            
+            # 1ª Tentativa: Achar pelo CNPJ
+            if cnpj_limpo and cnpj_limpo in map_cnpj:
+                cliente_id = map_cnpj[cnpj_limpo]
+            # 2ª Tentativa: Achar pelo Telefone (caso CNPJ seja novo ou vazio)
+            elif tel_limpo and tel_limpo in map_tel:
+                cliente_id = map_tel[tel_limpo]
+            
+            if cliente_id:
+                count_atualizados += 1
+            else:
+                count_novos += 1
+
+            if not cnpj_limpo and not tel_limpo:
+                count_sem_doc += 1
+            
+            # --- DISTÂNCIA ---
+            coluna_preco = 'preco_entrega'
+            dist_val = 0
+            val_dist = row.get('DISTANCIA')
+            if pd.notna(val_dist):
+                try:
+                    dist_limpa = re.sub(r'\D', '', str(val_dist))
+                    if dist_limpa:
+                        dist_val = int(dist_limpa)
+                        if dist_val < 100: coluna_preco = 'preco_entrega'
+                        elif dist_val < 200: coluna_preco = 'preco_100a199km'
+                        elif dist_val < 300: coluna_preco = 'preco_200a299km'
+                        elif dist_val < 400: coluna_preco = 'preco_300a399km'
+                        elif dist_val <= 500: coluna_preco = 'preco_acima400km'
+                        elif dist_val <= 600: coluna_preco = 'preco_acima500km'
+                        else: coluna_preco = 'preco_acima600km'
+                except:
+                    dist_val = 0
+
+            # --- VISUALIZA PREÇO ---
+            visualiza = True
+            val_visu = str(row.get('VISUALIZAPRECO', '')).lower().strip()
+            if val_visu in ['não', 'nao', 'n', 'false', '0', 'block']:
+                visualiza = False
+            
+            # Monta o objeto do cliente
+            cliente_dict = {
+                'representante_id': representante_id,
+                'nome': str(row['NOME']).strip().upper(),
+                'cnpj': cnpj_limpo,
+                'telefone': tel_limpo,
+                'cidade': str(row.get('CIDADE', '')).strip(),
+                'distancia_km': dist_val,
+                'coluna_preco': coluna_preco,
+                'visualiza_preco': visualiza,
+                'senha_hash': hash_senha('temp123')
+            }
+            
+            # SE ACHAMOS O ID, ADICIONAMOS AO DICIONÁRIO
+            # Isso força o Supabase a fazer UPDATE na linha certa, evitando conflito de chave única
+            if cliente_id:
+                cliente_dict['id'] = cliente_id
+            
+            clientes.append(cliente_dict)
+        
+        if not clientes:
+            st.warning("Nenhum cliente válido encontrado.")
+            return
+
+        # Upsert usando 'id' como chave de conflito. 
+        # Quem tem ID atualiza, quem não tem cria novo.
+        supabase.table('clientes').upsert(clientes, on_conflict='id').execute()
+        
+        st.success(f"✅ Processo finalizado! {len(clientes)} clientes processados.")
+        st.caption(f"📝 Novos: {count_novos} | 🔄 Atualizados: {count_atualizados}")
+        
+        if count_sem_doc > 0:
+            st.warning(f"⚠️ Nota: {count_sem_doc} clientes sem CNPJ/Telefone.")
+        
+    except Exception as e:
+        st.error(f"Erro ao processar planilha: {e}")
+
+# =====================================================================
+# FUNÇÕES DE DADOS - PRODUTOS
+# =====================================================================
+
+def carregar_produtos(representante_id):
+    """Carrega produtos do representante"""
+    try:
+        response = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erro ao carregar produtos: {e}")
+        return pd.DataFrame()
+
+def buscar_produtos(representante_id, termo):
+    """Busca produtos por código ou nome"""
+    try:
+        termo_limpo = termo.lower().strip()
+        response = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
+        
+        if not response.data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(response.data)
+        
+        # Filtro no código ou produto
+        mask = (
+            df['codigo'].str.lower().str.contains(termo_limpo, na=False) |
+            df['produto'].str.lower().str.contains(termo_limpo, na=False)
+        )
+        
+        return df[mask].head(20)
+        
+    except Exception as e:
+        st.error(f"Erro ao buscar produtos: {e}")
+        return pd.DataFrame()
+
+def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
+    """
+    Retorna o preço do produto baseado na coluna de preço do cliente
+    e forma de recebimento (retirada ou entrega)
+    """
+    if forma_recebimento == 'Retirada no centro de distribuição':
+        preco = produto_row.get('preco_retira')
+    else:
+        # Entrega - usa a coluna de preço baseada na distância
+        preco = produto_row.get(coluna_preco)
+    
+    return preco if preco and not pd.isna(preco) else None
+
+def upload_tabela_precos_csv(arquivo, representante_id):
+    """
+    Lê CSV ou Excel de preços e faz upsert no banco (em lotes)
+    """
+    try:
+        # Detectar o tipo de arquivo pelo nome
+        nome_arquivo = arquivo.name.lower()
+        arquivo.seek(0)
+        
+        if nome_arquivo.endswith('.xlsx') or nome_arquivo.endswith('.xls'):
+            st.info("📊 Lendo arquivo Excel...")
+            df = pd.read_excel(arquivo, engine='openpyxl', dtype=str)
+        elif nome_arquivo.endswith('.csv'):
+            st.info("📄 Lendo arquivo CSV...")
+            try:
+                df = pd.read_csv(arquivo, sep=',', encoding='utf-8', dtype=str)
+            except UnicodeDecodeError:
+                arquivo.seek(0)
+                try:
+                    df = pd.read_csv(arquivo, sep=',', encoding='latin-1', dtype=str)
+                except:
+                    arquivo.seek(0)
+                    df = pd.read_csv(arquivo, sep=';', encoding='latin-1', dtype=str)
+        else:
+            st.error("❌ Formato de arquivo não suportado. Use CSV ou Excel (.xlsx)")
+            return
+        
+        df = df.dropna(how='all')
+        # Limpar nomes das colunas
+        df.columns = [str(c).strip().replace(' ', '').replace('\n', '') for c in df.columns]
+        
+        # Validar colunas mínimas
+        if 'Codigo' not in df.columns and 'Código' not in df.columns:
+            st.error("❌ Coluna 'Codigo' não encontrada no arquivo")
+            return
+        if 'Produto' not in df.columns:
+            st.error("❌ Coluna 'Produto' não encontrada no arquivo")
+            return
+        
+        if 'Código' in df.columns and 'Codigo' not in df.columns:
+            df['Codigo'] = df['Código']
+            
+        df = df[(df['Codigo'].notna()) & (df['Codigo'] != '') & (df['Produto'].notna())]
+        
+        produtos = []
+        erros = 0
+        
+        # --- NOVO: Captura a hora exata do upload para forçar atualização da data ---
+        agora_iso = datetime.now(timezone.utc).isoformat()
+        
+        for idx, row in df.iterrows():
+            try:
+                produtos.append({
+                    'representante_id': representante_id,
+                    'codigo': str(row.get('Codigo', '')).strip(),
+                    'produto': str(row.get('Produto', '')).strip(),
+                    'unidade': str(row.get('Unidade', '')).strip() if pd.notna(row.get('Unidade')) else None,
+                    'preco_retira': parse_preco(row.get('Retira')),
+                    'preco_entrega': parse_preco(row.get('Entrega')), 
+                    'preco_100a199km': parse_preco(row.get('Preco100a199km')),
+                    'preco_200a299km': parse_preco(row.get('Preco200a299km')),
+                    'preco_300a399km': parse_preco(row.get('Preco300a399km')),
+                    'preco_acima400km': parse_preco(row.get('PrecoAcima400km')),
+                    'preco_acima500km': parse_preco(row.get('PrecoAcima500km')),
+                    'preco_acima600km': parse_preco(row.get('PrecoAcima600km')),
+                    # FORÇA A DATA DE ATUALIZAÇÃO:
+                    'created_at': agora_iso 
+                })
+            except Exception as e:
+                erros += 1
+         
+        # ========================================
+        # UPLOAD EM LOTES
+        # ========================================
+        total_produtos = len(produtos)
+        batch_size = 500
+        total_batches = (total_produtos + batch_size - 1) // batch_size
+        
+        st.info(f"💾 Salvando {total_produtos} produtos em {total_batches} lotes...")
+        progress_bar = st.progress(0)
+        produtos_salvos = 0
+        
+        for i in range(0, total_produtos, batch_size):
+            batch = produtos[i:i + batch_size]
+            try:
+                supabase.table('produtos').upsert(batch, on_conflict='representante_id,codigo').execute()
+                produtos_salvos += len(batch)
+                progress_bar.progress(produtos_salvos / total_produtos)
+            except Exception as e:
+                st.error(f"❌ Erro ao salvar lote: {e}")
+                break
+        
+        st.success(f"✅ {produtos_salvos} produtos importados/atualizados!")
+
+    except Exception as e:
+        st.error(f"❌ Erro crítico: {e}")
+
+# =====================================================================
+# FUNÇÕES DE DADOS - COTAÇÕES
+# =====================================================================
+
+def carregar_cotacoes(representante_id):
     """Carrega cotações do representante"""
-    cotacoes_path = get_cotacoes_path(username_rep)
+    try:
+        response = supabase.table('cotacoes').select('*, clientes(nome, telefone)').eq('representante_id', representante_id).order('created_at', desc=True).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erro ao carregar cotações: {e}")
+        return pd.DataFrame()
 
-    if not os.path.exists(cotacoes_path):
-        return pd.DataFrame(columns=[
-            "id", "cliente_nome", "cliente_telefone", "representante", "status",
-            "data", "forma_recebimento", "total_original", "desconto_percentual", "total"
-        ])
+def carregar_cotacoes_cliente(cliente_id):
+    """Carrega cotações de um cliente"""
+    try:
+        response = supabase.table('cotacoes').select('*').eq('cliente_id', cliente_id).order('created_at', desc=True).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erro ao carregar cotações: {e}")
+        return pd.DataFrame()
 
-    df = pd.read_csv(cotacoes_path)
-    if "total_original" not in df.columns:
-        df["total_original"] = df["total"]
-    if "desconto_percentual" not in df.columns:
-        df["desconto_percentual"] = 0.0
-
-    return df
-
-def load_itens_cotacao(username_rep):
-    """Carrega itens das cotações do representante"""
-    itens_path = get_itens_cotacao_path(username_rep)
-
-    if not os.path.exists(itens_path):
-        return pd.DataFrame(columns=[
-            "id_cotacao", "codigo", "produto", "unidade", "quantidade",
-            "preco_retira", "preco_final", "subtotal_retira", "subtotal_final"
-        ])
-
-    return pd.read_csv(itens_path)
+def carregar_itens_cotacao(cotacao_id):
+    """Carrega itens de uma cotação"""
+    try:
+        response = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cotacao_id).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Erro ao carregar itens: {e}")
+        return pd.DataFrame()
 
 def gerar_id_cotacao(cliente_nome):
-    """Gera ID da cotação"""
-    cliente_prefix = re.sub(r"\W", "", cliente_nome.upper())[:4].ljust(4, "X")
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    """Gera ID único da cotação"""
+    cliente_prefix = re.sub(r'\W', '', cliente_nome.upper())[:4].ljust(4, 'X')
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
     return f"{cliente_prefix}{timestamp}"
 
-def salvar_cotacao(cliente_row, itens, forma_recebimento, username_rep):
-    """Salva cotação e itens"""
-    if not itens:
-        st.error("Nenhum item na cotação.")
+def salvar_cotacao(representante_id, cliente_id, cliente_nome, itens, forma_recebimento):
+    """
+    Salva cotação e itens no banco
+    """
+    try:
+        # Calcular total
+        total = sum([item['subtotal'] for item in itens])
+        
+        # Gerar ID
+        cotacao_id = gerar_id_cotacao(cliente_nome)
+        
+        # Inserir cotação
+        supabase.table('cotacoes').insert({
+            'id': cotacao_id,
+            'representante_id': representante_id,
+            'cliente_id': cliente_id,
+            'status': 'PENDENTE',
+            'forma_recebimento': forma_recebimento,
+            'total_original': total,
+            'desconto_geral_percentual': 0,
+            'total_final': total
+        }).execute()
+        
+        # Inserir itens
+        itens_para_inserir = []
+        for item in itens:
+            itens_para_inserir.append({
+                'cotacao_id': cotacao_id,
+                'produto_id': item.get('produto_id'),
+                'codigo': item['codigo'],
+                'produto': item['produto'],
+                'unidade': item['unidade'],
+                'quantidade': item['quantidade'],
+                'preco_unitario': item['preco_unitario'],
+                'desconto_percentual': item.get('desconto_percentual', 0),
+                'subtotal': item['subtotal']
+            })
+        
+        supabase.table('cotacao_itens').insert(itens_para_inserir).execute()
+        
+        st.success(f"✅ Cotação {cotacao_id} criada com sucesso!")
+        return cotacao_id
+        
+    except Exception as e:
+        st.error(f"Erro ao salvar cotação: {e}")
         return None
 
-    cotacoes = load_cotacoes(username_rep)
-    itens_cot = load_itens_cotacao(username_rep)
-
-    id_cotacao = gerar_id_cotacao(cliente_row["NOME"])
-    total_final = sum(item["subtotal_final"] for item in itens)
-
-    nova_cot = {
-        "id": id_cotacao,
-        "cliente_nome": cliente_row["NOME"],
-        "cliente_telefone": cliente_row.get("TELEFONE", ""),
-        "representante": username_rep,
-        "status": "PENDENTE",
-        "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "forma_recebimento": forma_recebimento,
-        "total_original": total_final,
-        "desconto_percentual": 0.0,
-        "total": total_final,
-    }
-    cotacoes = pd.concat([cotacoes, pd.DataFrame([nova_cot])], ignore_index=True)
-
-    novos_itens = []
-    for item in itens:
-        novos_itens.append({
-            "id_cotacao": id_cotacao,
-            "codigo": item["codigo"],
-            "produto": item["produto"],
-            "unidade": item["unidade"],
-            "quantidade": item["quantidade"],
-            "preco_retira": item["preco_retira"],
-            "preco_final": item["preco_final"],
-            "subtotal_retira": item["subtotal_retira"],
-            "subtotal_final": item["subtotal_final"],
-        })
-    itens_cot = pd.concat([itens_cot, pd.DataFrame(novos_itens)], ignore_index=True)
-
-    cotacoes.to_csv(get_cotacoes_path(username_rep), index=False)
-    itens_cot.to_csv(get_itens_cotacao_path(username_rep), index=False)
-
-    return id_cotacao
-
-def atualizar_status_cotacao(id_cotacao, novo_status, username_rep):
+def atualizar_status_cotacao(cotacao_id, novo_status):
     """Atualiza status da cotação"""
-    cotacoes = load_cotacoes(username_rep)
-    if id_cotacao not in cotacoes["id"].values:
-        st.error("Cotação não encontrada.")
-        return
-
-    cotacoes.loc[cotacoes["id"] == id_cotacao, "status"] = novo_status
-    cotacoes.to_csv(get_cotacoes_path(username_rep), index=False)
-    st.success(f"Status atualizado para {novo_status}.")
-
-def aplicar_desconto_cotacao(id_cotacao, desconto_percentual, username_rep):
-    """Aplica desconto na cotação"""
-    cotacoes = load_cotacoes(username_rep)
-    if id_cotacao not in cotacoes["id"].values:
-        st.error("Cotação não encontrada.")
-        return
-
-    idx = cotacoes[cotacoes["id"] == id_cotacao].index[0]
-    total_original = float(cotacoes.loc[idx, "total_original"])
-    novo_total = total_original * (1 - desconto_percentual / 100)
-
-    cotacoes.loc[idx, "desconto_percentual"] = desconto_percentual
-    cotacoes.loc[idx, "total"] = novo_total
-
-    cotacoes.to_csv(get_cotacoes_path(username_rep), index=False)
-    st.success(f"Desconto de {desconto_percentual}% aplicado!")
-
-def gerar_pdf_cotacao(cot_row, itens_df, show_prices=True):
-    """Gera PDF da cotação"""
-    pdf = FPDF()
-    pdf.add_page()
-
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "Cotacao de Produtos", ln=True)
-
-    pdf.set_font("Arial", "", 11)
-    pdf.cell(0, 8, f"ID: {cot_row.get('id', '')}", ln=True)
-    pdf.cell(0, 8, f"Cliente: {cot_row.get('cliente_nome', '')}", ln=True)
-    pdf.cell(0, 8, f"Telefone: {cot_row.get('cliente_telefone', '')}", ln=True)
-    pdf.cell(0, 8, f"Data: {cot_row.get('data', '')}", ln=True)
-    pdf.cell(0, 8, f"Forma de recebimento: {cot_row.get('forma_recebimento', '')}", ln=True)
-
     try:
-        total_original = float(cot_row.get("total_original", cot_row.get("total", 0.0)))
-    except (ValueError, TypeError):
-        total_original = 0.0
+        supabase.table('cotacoes').update({
+            'status': novo_status
+        }).eq('id', cotacao_id).execute()
+        st.success(f"Status atualizado para {novo_status}!")
+    except Exception as e:
+        st.error(f"Erro ao atualizar status: {e}")
 
+def aplicar_desconto_geral(cotacao_id, desconto_percentual):
+    """Aplica desconto geral na cotação"""
     try:
-        desconto = float(cot_row.get("desconto_percentual", 0.0))
-    except (ValueError, TypeError):
-        desconto = 0.0
+        # Buscar cotação
+        cot = supabase.table('cotacoes').select('*').eq('id', cotacao_id).single().execute()
+        total_original = float(cot.data['total_original'])
+        
+        # Calcular novo total
+        novo_total = total_original * (1 - desconto_percentual / 100)
+        
+        # Atualizar
+        supabase.table('cotacoes').update({
+            'desconto_geral_percentual': desconto_percentual,
+            'total_final': novo_total
+        }).eq('id', cotacao_id).execute()
+        
+        st.success(f"Desconto de {desconto_percentual}% aplicado!")
+        
+    except Exception as e:
+        st.error(f"Erro ao aplicar desconto: {e}")
 
-    if show_prices:
-        pdf.cell(0, 8, f"Total original: R$ {total_original:.2f}", ln=True)
+def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual):
+    """
+    1. Atualiza descontos individuais e subtotais de cada item
+    2. Recalcula o total da cotação
+    3. Reaplica o desconto geral e SALVA a porcentagem
+    """
+    try:
+        soma_subtotais = 0.0
+        
+        # 1. Atualizar cada item no banco
+        for _, row in df_itens_editado.iterrows():
+            preco = float(row['Preço Unit.'])
+            qtd = float(row['Qtde'])
+            
+            # Pega o desconto do item (garantindo que não seja nulo)
+            desc_item = float(row.get('Desconto (%)', 0.0))
+            
+            # Cálculo do subtotal do item com desconto
+            novo_subtotal = (preco * qtd) * (1 - desc_item / 100)
+            soma_subtotais += novo_subtotal
+            
+            supabase.table('cotacao_itens').update({
+                'desconto_percentual': desc_item,
+                'subtotal': novo_subtotal
+            }).eq('cotacao_id', cotacao_id).eq('codigo', row['Código']).execute()
+            
+        # 2. Atualizar totais da Cotação
+        total_final = soma_subtotais * (1 - desconto_geral_atual / 100)
+        
+        # --- A CORREÇÃO ESTÁ AQUI EMBAIXO ---
+        supabase.table('cotacoes').update({
+            'total_original': soma_subtotais, 
+            'total_final': total_final,
+            'desconto_geral_percentual': desconto_geral_atual  # <--- FALTAVA ISSO!
+        }).eq('id', cotacao_id).execute()
+        
+        return True
+    except Exception as e:
+        st.error(f"Erro ao recalcular: {e}")
+        return False
 
-        if desconto:
-            pdf.cell(0, 8, f"Desconto: {desconto:.1f}%", ln=True)
+# =====================================================================
+# GERAÇÃO DE PDF
+# =====================================================================
 
-        try:
-            total_final = float(cot_row.get('total', 0.0))
-        except (ValueError, TypeError):
-            total_final = 0.0
-
-        pdf.cell(0, 8, f"Total final: R$ {total_final:.2f}", ln=True)
-    else:
-        pdf.cell(0, 8, "Valores totais a serem informados pelo representante.", ln=True)
-    pdf.ln(4)
-
-    pdf.set_font("Arial", "B", 10)
-    pdf.cell(20, 8, "Cod.", border=1)
-    pdf.cell(60, 8, "Produto", border=1)
-    pdf.cell(12, 8, "Un.", border=1)
-    pdf.cell(12, 8, "Qtde", border=1)
-    if show_prices:
-        pdf.cell(28, 8, "Preço Unitário", border=1)
-        pdf.cell(32, 8, "Subtotal", border=1, ln=True)
-    else:
-        pdf.cell(60, 8, "Preços a serem informados", border=1, ln=True)
-
-    pdf.set_font("Arial", "", 9)
-    for _, row in itens_df.iterrows():
-        codigo = str(row.get("codigo", ""))
-        produto = str(row.get("produto", ""))[:30]
-        unidade = str(row.get("unidade", ""))
-        qtde = str(row.get("quantidade", ""))
-
-        pdf.cell(20, 6, codigo, border=1)
-        pdf.cell(60, 6, produto, border=1)
-        pdf.cell(12, 6, unidade, border=1)
-        pdf.cell(12, 6, qtde, border=1)
-        if show_prices:
-            try:
-                preco_final = float(row.get("preco_final", 0.0))
-            except (ValueError, TypeError):
-                preco_final = 0.0
-
-            try:
-                subtotal_final = float(row.get("subtotal_final", 0.0))
-            except (ValueError, TypeError):
-                subtotal_final = 0.0
-
-            pdf.cell(28, 6, f"{preco_final:.2f}", border=1)
-            pdf.cell(32, 6, f"{subtotal_final:.2f}", border=1, ln=True)
+def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True):
+    """
+    Gera PDF da cotação com detalhamento de descontos (Total Real, Item e Extra)
+    """
+    try:
+        # Buscar cotação
+        cot_response = supabase.table('cotacoes').select('*, clientes(nome, telefone)').eq('id', cotacao_id).single().execute()
+        cotacao = cot_response.data
+        
+        # Buscar itens
+        itens_response = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cotacao_id).execute()
+        itens = itens_response.data
+        
+        # Dados do cliente
+        cliente = cotacao.get('clientes', {})
+        
+        # Gerar PDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font('Arial', 'B', 14)
+        pdf.cell(0, 10, 'Cotacao de Produtos', ln=True)
+        
+        pdf.set_font('Arial', '', 11)
+        pdf.cell(0, 8, f"ID: {cotacao['id']}", ln=True)
+        pdf.cell(0, 8, f"Cliente: {cliente.get('nome', 'N/A')}", ln=True)
+        pdf.cell(0, 8, f"Telefone: {cliente.get('telefone', 'N/A')}", ln=True)
+        pdf.cell(0, 8, f"Data: {cotacao['created_at'][:10] if cotacao.get('created_at') else ''}", ln=True)
+        pdf.cell(0, 8, f"Forma de recebimento: {cotacao.get('forma_recebimento', 'N/A')}", ln=True)
+        
+        pdf.ln(4)
+        
+        # --- BLOCO DE TOTAIS MELHORADO ---
+        if mostrar_precos:
+            # Pegamos os valores do banco
+            total_final = float(cotacao.get('total_final', 0))
+            soma_subtotais = float(cotacao.get('total_original', 0)) # Subtotais já com desc item
+            desconto_extra_pct = float(cotacao.get('desconto_geral_percentual', 0))
+            
+            # Recalcular o Bruto Real (Preço Cheio * Qtd) iterando itens
+            total_bruto_real = 0.0
+            for item in itens:
+                p = float(item.get('preco_unitario', 0))
+                q = float(item.get('quantidade', 0))
+                total_bruto_real += (p * q)
+            
+            # Calcular os descontos em Reais
+            total_desc_itens = total_bruto_real - soma_subtotais
+            total_desc_extra = soma_subtotais - total_final
+            
+            # 1. Total Real (Bruto)
+            pdf.cell(0, 8, f"Total Real (Sem descontos): R$ {total_bruto_real:.2f}", ln=True)
+            
+            # 2. Desconto nos Itens (Se houver)
+            if total_desc_itens > 0.01:
+                pdf.set_text_color(200, 0, 0)
+                pdf.cell(0, 8, f"Desconto nos Itens: - R$ {total_desc_itens:.2f}", ln=True)
+                pdf.set_text_color(0, 0, 0)
+                
+            # 3. Desconto Extra (Se houver)
+            if total_desc_extra > 0.01:
+                pdf.set_text_color(200, 0, 0)
+                msg_extra = f"Desconto Extra: - R$ {total_desc_extra:.2f}"
+                if desconto_extra_pct > 0:
+                    msg_extra += f" ({desconto_extra_pct:.1f}%)"
+                pdf.cell(0, 8, msg_extra, ln=True)
+                pdf.set_text_color(0, 0, 0)
+            
+            # 4. Total Final em Negrito
+            pdf.ln(2)
+            pdf.set_font('Arial', 'B', 12)
+            pdf.cell(0, 10, f"TOTAL FINAL: R$ {total_final:.2f}", ln=True)
+            pdf.set_font('Arial', '', 11)
+            
         else:
-            pdf.cell(60, 6, "-", border=1, ln=True)
-
-    pdf.ln(5)
-    pdf.set_font("Arial", "", 8)
-    pdf.cell(0, 8, "Desenvolvido por www.beccai.com.br", ln=True, align="R")
-
-    try:
-        out = pdf.output(dest="S")
+            pdf.cell(0, 8, "Valores a serem informados pelo representante.", ln=True)
+        # ---------------------------------
+        
+        pdf.ln(4)
+        
+        # Cabeçalho da tabela
+        pdf.set_font('Arial', 'B', 10)
+        pdf.cell(25, 8, 'Cod.', border=1)
+        pdf.cell(75, 8, 'Produto', border=1)
+        pdf.cell(15, 8, 'Un.', border=1)
+        pdf.cell(15, 8, 'Qtd', border=1)
+        
+        if mostrar_precos:
+            pdf.cell(25, 8, 'Unit.', border=1)
+            pdf.cell(30, 8, 'Subtotal', border=1, ln=True)
+        else:
+            pdf.cell(55, 8, 'Precos a informar', border=1, ln=True)
+        
+        # Itens
+        pdf.set_font('Arial', '', 9)
+        for item in itens:
+            pdf.cell(25, 6, str(item.get('codigo', ''))[:10], border=1)
+            pdf.cell(75, 6, str(item.get('produto', ''))[:35], border=1)
+            pdf.cell(15, 6, str(item.get('unidade', ''))[:5], border=1)
+            pdf.cell(15, 6, str(item.get('quantidade', '')), border=1)
+            
+            if mostrar_precos:
+                preco = float(item.get('preco_unitario', 0))
+                subtotal = float(item.get('subtotal', 0))
+                
+                pdf.cell(25, 6, f"{preco:.2f}", border=1)
+                pdf.cell(30, 6, f"{subtotal:.2f}", border=1, ln=True)
+            else:
+                pdf.cell(55, 6, '-', border=1, ln=True)
+        
+        pdf.ln(5)
+        pdf.set_font('Arial', '', 8)
+        pdf.cell(0, 8, 'Gerado via RC Online', ln=True, align='R')
+        
+        return pdf.output(dest='S').encode('latin-1')
+        
     except Exception as e:
         st.error(f"Erro ao gerar PDF: {e}")
-        return b""
+        return b''
 
-    if isinstance(out, (bytes, bytearray)):
-        return bytes(out)
-    if isinstance(out, str):
-        return out.encode("latin-1")
+# =====================================================================
+# PÁGINAS DA APLICAÇÃO - REPRESENTANTE
+# =====================================================================
 
-    raise RuntimeError("Não foi possível exportar PDF")
-
-# ========================= 
-# PÁGINAS - REPRESENTANTE
-# ========================= 
-def pagina_upload_tabela_precos(username_rep):
-    """Página para importar a tabela de preços"""
-    st.subheader("📊 Gerenciar Tabela de Preços")
-
-    tabela_path = get_tabela_path(username_rep)
-
-    if os.path.exists(tabela_path):
-        st.success("✅ Você já possui uma tabela de preços cadastrada")
-
-        df_atual = load_tabela_geral(username_rep)
-        if not df_atual.empty:
-            st.info(f"Produtos cadastrados: {len(df_atual)}")
-
-            with st.expander("👁️ Visualizar tabela atual"):
-                st.dataframe(df_atual.head(50))
-
-        st.warning("⚠️ Carregar uma nova tabela substituirá a atual")
-    else:
-        st.info("Nenhuma tabela de preços cadastrada ainda")
+def pagina_dashboard(representante_id):
+    """Dashboard do representante"""
+    st.title("📊 Dashboard Gerencial")
+    
+    # --- CÁLCULO DE DADOS ---
+    clientes = carregar_clientes(representante_id)
+    produtos = carregar_produtos(representante_id)
+    cotacoes = carregar_cotacoes(representante_id)
+    
+    # --- LINHA 1: INDICADORES GERAIS ---
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.metric("Total de Clientes", len(clientes))
+    with col2: st.metric("Produtos Ativos", len(produtos))
+    with col3: st.metric("Total de Pedidos", len(cotacoes))
+    with col4:
+        if not cotacoes.empty:
+            vendas = cotacoes[cotacoes['status'] == 'APROVADA']['total_final'].sum()
+            st.metric("Vendas Aprovadas", f"R$ {vendas:,.2f}")
+        else:
+            st.metric("Vendas Aprovadas", "R$ 0,00")
 
     st.markdown("---")
-    st.markdown("### 📤 Carregar Nova Tabela")
 
-    st.markdown("""
-    **Formato esperado do arquivo CSV:**
-    - Separador: vírgula (,)
-    - Codificação: UTF-8
-    - Colunas obrigatórias: `Codigo`, `Produto`, `Unidade`, `Retira`
-    - Colunas de preço por distância: `Preco100a199km`, `Preco200a299km`, etc.
-    """)
-
-    arquivo_upload = st.file_uploader(
-        "Selecione o arquivo CSV com a tabela de preços",
-        type=['csv'],
-        help="Arquivo CSV com produtos e preços"
-    )
-
-    if arquivo_upload is not None:
-        try:
-            df_preview = pd.read_csv(arquivo_upload, sep=",", encoding="utf-8", dtype=str)
-            df_preview.columns = [str(c).strip().replace(" ", "") for c in df_preview.columns]
-
-            st.success("✅ Arquivo carregado com sucesso!")
-            st.info(f"Total de produtos: {len(df_preview)}")
-
-            colunas_necessarias = ["Codigo", "Produto", "Unidade", "Retira"]
-            colunas_faltando = [col for col in colunas_necessarias if col not in df_preview.columns]
-
-            if colunas_faltando:
-                st.error(f"❌ Colunas obrigatórias faltando: {', '.join(colunas_faltando)}")
+    # --- LINHA 2: GESTÃO DE COTAÇÕES ---
+    st.subheader("🚦 Status dos Pedidos")
+    c1, c2, c3 = st.columns(3)
+    
+    if not cotacoes.empty:
+        # Converter a coluna de data para datetime pandas
+        cotacoes['data_dt'] = pd.to_datetime(cotacoes['created_at'])
+        
+        pendentes = cotacoes[cotacoes['status'] == 'PENDENTE']
+        aprovadas = cotacoes[cotacoes['status'] == 'APROVADA']
+        canceladas = cotacoes[cotacoes['status'] == 'CANCELADA']
+        
+        with c1:
+            st.info(f"🕒 **Pendentes: {len(pendentes)}**")
+            # --- CORREÇÃO DO CÁLCULO DE TEMPO ---
+            if not pendentes.empty:
+                mais_antiga = pendentes['data_dt'].min()
+                
+                # Pegamos o agora em UTC para bater com o horário do banco
+                agora = datetime.now(timezone.utc)
+                
+                # --- CORREÇÃO DO ERRO ---
+                # Removemos a informação de fuso horário de AMBOS para permitir a subtração
+                
+                # 1. Remove fuso da data do banco (se tiver)
+                if mais_antiga.tzinfo:
+                    mais_antiga = mais_antiga.tz_localize(None)
+                
+                # 2. Remove fuso do agora (ESSA LINHA QUE FALTAVA)
+                agora = agora.replace(tzinfo=None)
+                
+                # Agora ambos são "naive" (sem fuso) e podem ser subtraídos
+                delta = agora - mais_antiga
+                
+                dias = delta.days
+                horas = delta.seconds // 3600
+                minutos = (delta.seconds % 3600) // 60
+                
+                if dias > 0:
+                    st.caption(f"⚠️ A mais antiga aguarda há **{dias}d {horas}h**")
+                elif horas > 0:
+                    st.caption(f"⚠️ A mais antiga aguarda há **{horas}h {minutos}min**")
+                else:
+                    st.caption(f"⚠️ A mais antiga aguarda há **{minutos} min**")
             else:
-                st.success("✅ Todas as colunas obrigatórias presentes")
+                st.caption("Nenhuma pendência! 🎉")
 
-                with st.expander("👁️ Pré-visualizar dados (50 primeiras linhas)"):
-                    st.dataframe(df_preview.head(50))
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("💾 Confirmar e Salvar Tabela", type="primary"):
-                        arquivo_upload.seek(0)
-                        with open(tabela_path, 'wb') as f:
-                            f.write(arquivo_upload.getvalue())
-                        st.success("✅ Tabela de preços salva com sucesso!")
-                        st.balloons()
-                        st.rerun()
-
-                with col2:
-                    if st.button("🗑️ Cancelar"):
-                        st.rerun()
-
-        except Exception as e:
-            st.error(f"❌ Erro ao processar arquivo: {e}")
-            st.info("Verifique se o arquivo está no formato correto (CSV com separador vírgula)")
-
-def pagina_upload_clientes(username_rep):
-    """Página para importar a planilha de clientes"""
-    st.subheader("👥 Gerenciar Clientes")
-
-    clientes_path = get_clientes_path(username_rep)
-
-    if os.path.exists(clientes_path):
-        st.success("✅ Você já possui uma planilha de clientes")
-
-        df_atual = load_clientes(username_rep)
-        if not df_atual.empty:
-            st.info(f"Clientes cadastrados: {len(df_atual)}")
-
-            with st.expander("👁️ Visualizar clientes atuais"):
-                st.dataframe(df_atual[['NOME', 'CNPJ', 'TELEFONE', 'CIDADE']])
-
-        st.warning("⚠️ Carregar uma nova planilha substituirá a atual")
+        with c2: st.success(f"✅ **Aprovadas: {len(aprovadas)}**")
+        with c3: st.error(f"❌ **Canceladas: {len(canceladas)}**")
     else:
-        st.info("Nenhuma planilha de clientes cadastrada ainda")
+        st.info("Nenhuma cotação para analisar.")
 
     st.markdown("---")
-    st.markdown("### 📤 Carregar Nova Planilha de Clientes")
+    
+    # --- LINHA 3: TABELA DETALHADA ---
+    if not cotacoes.empty:
+        st.subheader("📋 Listagem Recente")
+        df_display = cotacoes.copy()
+        
+        # 1. Nome Cliente
+        if 'clientes' in df_display.columns:
+            df_display['cliente_nome'] = df_display['clientes'].apply(lambda x: x.get('nome', 'N/A') if isinstance(x, dict) else 'N/A')
+        
+        # 2. Formatar Data (CORREÇÃO DE FUSO -3h)
+        # Usamos pd.Timedelta(-3, unit='h') para ajustar visualmente para o Brasil
+        df_display['Data'] = (df_display['data_dt'] - pd.Timedelta(hours=3)).dt.strftime('%d/%m/%Y %H:%M')
+        
+        df_display['Valor Final'] = df_display['total_final'].apply(lambda x: f"R$ {float(x):.2f}" if x else "R$ 0.00")
+        
+        df_final = df_display[['id', 'Data', 'cliente_nome', 'status', 'Valor Final']].rename(columns={
+            'id': 'ID Pedido', 'cliente_nome': 'Cliente', 'status': 'Status'
+        })
+        
+        st.dataframe(df_final, width='stretch', hide_index=True)
 
+def pagina_upload_tabela_precos(representante_id):
+    """Página para upload da tabela de preços"""
+    st.subheader("📤 Gerenciar Tabela de Preços")
+    
+    produtos = carregar_produtos(representante_id)
+    
+    if not produtos.empty:
+        if 'created_at' in produtos.columns:
+            # Pega a maior data
+            ultima_atualizacao = pd.to_datetime(produtos['created_at']).max()
+            
+            # --- CORREÇÃO DE FUSO: Remover timezone e subtrair 3h ---
+            if ultima_atualizacao.tzinfo:
+                ultima_atualizacao = ultima_atualizacao.tz_localize(None)
+            ultima_atualizacao = ultima_atualizacao - pd.Timedelta(hours=3)
+            
+            data_fmt = ultima_atualizacao.strftime('%d/%m/%Y às %H:%M')
+            st.success(f"✅ Tabela Ativa (Última atualização: **{data_fmt}**)")
+        else:
+            st.success("✅ Tabela Ativa")
+            
+        st.info(f"Total de produtos cadastrados: {len(produtos)}")
+        
+        with st.expander("👁️ Visualizar tabela atual"):
+            st.dataframe(produtos[['codigo', 'produto', 'unidade', 'preco_retira']].head(50))
+        st.warning("⚠️ Carregar uma nova tabela substituirá/atualizará os produtos existentes.")
+    else:
+        st.error("📋 Nenhuma tabela de preços cadastrada ainda.")
+    
+    # ... (O restante da função de upload continua IGUAL ao anterior) ...
+    st.markdown("---")
+    st.markdown("### 📥 Carregar Nova Tabela")
+    # (Copie o resto do código de upload igual estava, não mudou lógica aqui)
+    # Para facilitar, vou deixar o bloco do upload resumido, você mantém o que já tinha:
+    st.markdown("""
+    **Formato esperado:** CSV ou Excel (.xlsx) com `Codigo` e `Produto`.
+    """)
+    arquivo_upload = st.file_uploader("Selecione o arquivo", type=['csv', 'xlsx', 'xls'])
+    
+    if arquivo_upload is not None:
+        if st.button("✅ Confirmar e Atualizar Tabela", type="primary", key="btn_confirmar_tabela"):
+             upload_tabela_precos_csv(arquivo_upload, representante_id)
+             st.balloons()
+             st.rerun()
+
+def pagina_upload_clientes(representante_id):
+    """Página para upload de clientes"""
+    st.subheader("📤 Gerenciar Clientes")
+    
+    # Verificar se já existem clientes
+    clientes = carregar_clientes(representante_id)
+    
+    if not clientes.empty:
+        st.success("✅ Você já possui clientes cadastrados")
+        st.info(f"Clientes cadastrados: {len(clientes)}")
+        
+        with st.expander("👁️ Visualizar clientes atuais"):
+            colunas_exibir = ['nome', 'cnpj', 'telefone', 'cidade']
+            # Garante que as colunas sejam tratadas como string para não quebrar a tabela
+            df_show = clientes.copy()
+            for col in ['cnpj', 'telefone']:
+                if col in df_show.columns:
+                    df_show[col] = df_show[col].astype(str).replace('nan', '')
+            
+            colunas_disponiveis = [c for c in colunas_exibir if c in df_show.columns]
+            st.dataframe(df_show[colunas_disponiveis], hide_index=True)
+        
+        st.warning("⚠️ Carregar uma nova planilha substituirá os dados atuais")
+    else:
+        st.info("📋 Nenhum cliente cadastrado ainda")
+    
+    st.markdown("---")
+    st.markdown("### 📥 Carregar Nova Planilha de Clientes")
     st.markdown("""
     **Formato esperado do arquivo Excel (.xlsx):**
-    - Colunas obrigatórias: `NOME`, `CNPJ`, `TELEFONE`
-    - Colunas opcionais: `CIDADE`, `DISTANCIA`, `VISUALIZA_PRECO`
+    - Colunas obrigatórias: `NOME`, `DISTANCIA`, `CNPJ` ou `TELEFONE`
+    - Colunas opcionais: `CIDADE`, `VISUALIZAPRECO`
     """)
-
+    
     arquivo_upload = st.file_uploader(
         "Selecione o arquivo Excel com os clientes",
         type=['xlsx'],
         help="Arquivo Excel (.xlsx) com dados dos clientes"
     )
-
+    
     if arquivo_upload is not None:
         try:
-            df_preview = pd.read_excel(arquivo_upload)
-            df_preview = df_preview[df_preview["NOME"].notna()].copy()
+            # Preview - CORREÇÃO AQUI: dtype=str força ler tudo como texto
+            df_preview = pd.read_excel(arquivo_upload, dtype=str)
+            
+            # Normalizar cabeçalhos para evitar erro de 'NOME' vs 'Nome'
             df_preview.columns = [str(c).strip().upper() for c in df_preview.columns]
-
+            
+            if 'NOME' in df_preview.columns:
+                 df_preview = df_preview[df_preview['NOME'].notna()].copy()
+            
             st.success("✅ Arquivo carregado com sucesso!")
             st.info(f"Total de clientes: {len(df_preview)}")
-
-            colunas_necessarias = ["NOME"]
-            colunas_faltando = [col for col in colunas_necessarias if col not in df_preview.columns]
-
-            if colunas_faltando:
-                st.error(f"❌ Colunas obrigatórias faltando: {', '.join(colunas_faltando)}")
+            
+            # Validar coluna obrigatória
+            if 'NOME' not in df_preview.columns:
+                st.error("❌ Coluna obrigatória faltando: NOME")
             else:
                 st.success("✅ Coluna NOME presente")
-
-                with st.expander("👁️ Pré-visualizar dados"):
-                    st.dataframe(df_preview)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("💾 Confirmar e Salvar Clientes", type="primary"):
-                        arquivo_upload.seek(0)
-                        df_save = pd.read_excel(arquivo_upload)
-                        df_save.to_excel(clientes_path, index=False)
-                        st.success("✅ Planilha de clientes salva com sucesso!")
-                        st.balloons()
-                        st.rerun()
-
-                with col2:
-                    if st.button("🗑️ Cancelar"):
-                        st.rerun()
-
+            
+            with st.expander("👁️ Pré-visualizar dados"):
+                # Preenche valores nulos com vazio para não mostrar "NaN"
+                st.dataframe(df_preview.fillna(""), hide_index=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("✅ Confirmar e Salvar Clientes", type="primary", key="btn_confirmar_clientes"):
+                    arquivo_upload.seek(0)
+                    upload_clientes_excel(arquivo_upload, representante_id)
+                    st.balloons()
+                    # Pequeno delay para garantir que deu tempo de ver a mensagem
+                    import time
+                    time.sleep(2)
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ Cancelar", key="btn_cancelar_clientes"):
+                    st.rerun()
+                    
         except Exception as e:
-            st.error(f"❌ Erro ao processar arquivo: {e}")
+            st.error(f"Erro ao processar arquivo: {e}")
             st.info("Verifique se o arquivo está no formato correto (Excel .xlsx)")
 
-def pagina_gestao_clientes_representante(username_rep):
-    """Página de gestão de clientes pelo representante"""
-    st.subheader("Gestão de Clientes")
-
-    df = load_clientes(username_rep)
-    if df.empty:
-        st.info("Nenhum cliente cadastrado.")
-        return
-
-    filtro_nome = st.text_input("Filtrar por nome do cliente:", "")
-    df_view = df.copy()
-
-    if filtro_nome.strip():
-        termo = filtro_nome.strip().lower()
-        df_view = df_view[df_view["NOME"].astype(str).str.lower().str.contains(termo)]
-
-    st.write(f"Total de clientes exibidos: {len(df_view)}")
-
-    novos_valores = {}
-    for idx, row in df_view.iterrows():
-        col1, col2, col3 = st.columns([4, 3, 3])
-
-        with col1:
-            st.write(f"**{row['NOME']}**")
-            st.write(f"CNPJ: {row.get('CNPJ', '')}")
-            st.write(f"Telefone: {row.get('TELEFONE', '')}")
-
-        with col2:
-            valor_atual = bool(row.get("VISUALIZA_PRECO", True))
-            novo_valor = st.checkbox(
-                "Pode ver preços",
-                value=valor_atual,
-                key=f"visu_preco_{idx}"
-            )
-            novos_valores[idx] = novo_valor
-
-        with col3:
-            st.write(f"Cidade: {row.get('CIDADE', '') if 'CIDADE' in df.columns else ''}")
-            st.write(f"Distância: {row.get('DISTANCIA', '') if 'DISTANCIA' in df.columns else ''}")
-
-    if st.button("Salvar todas as alterações"):
-        for idx, novo_valor in novos_valores.items():
-            df.loc[idx, "VISUALIZA_PRECO"] = novo_valor
-        salvar_clientes_df(df, username_rep)
-
-def pagina_gerenciar_cotacoes_representante(username_rep):
-    """Página para gerenciar cotações do representante"""
-    st.subheader("Gerenciar Cotações")
-
-    cotacoes = load_cotacoes(username_rep)
-    itens_cot = load_itens_cotacao(username_rep)
-
-    if cotacoes.empty:
-        st.info("Nenhuma cotação registrada ainda")
-        return
-
-    filtro_status = st.selectbox(
-        "Filtrar por status:",
-        ["TODAS", "PENDENTE", "APROVADA", "CANCELADA"]
-    )
-
-    df_view = cotacoes.copy()
-    if filtro_status != "TODAS":
-        df_view = df_view[df_view["status"] == filtro_status]
-
-    df_view = df_view.sort_values("data", ascending=False)
-
-    st.write(f"Total de cotações: {len(df_view)}")
-
-    for _, cot in df_view.iterrows():
-        with st.expander(f"Cotação {cot['id']} - {cot['cliente_nome']} - {cot['status']}"):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.write(f"**Cliente:** {cot['cliente_nome']}")
-                st.write(f"**Telefone:** {cot.get('cliente_telefone', '')}")
-                st.write(f"**Data:** {cot['data']}")
-                st.write(f"**Forma de recebimento:** {cot.get('forma_recebimento', '')}")
-
-            with col2:
-                try:
-                    total_orig = float(cot.get('total_original', cot['total']))
-                    desconto = float(cot.get('desconto_percentual', 0))
-                    total_final = float(cot['total'])
-                except (ValueError, TypeError):
-                    total_orig = total_final = 0
-                    desconto = 0
-
-                st.write(f"**Total original:** R$ {total_orig:.2f}")
-
-                if desconto > 0:
-                    st.write(f"**Desconto aplicado:** {desconto:.1f}%")
-
-                st.write(f"**Total final:** R$ {total_final:.2f}")
-
-            itens = itens_cot[itens_cot['id_cotacao'] == cot['id']]
-            if not itens.empty:
-                st.markdown("**Itens:**")
-                df_show = itens[['codigo', 'produto', 'quantidade', 'preco_final', 'subtotal_final']].rename(columns={
-                    'codigo': 'Código',
-                    'produto': 'Produto',
-                    'quantidade': 'Qtde',
-                    'preco_final': 'Preço Unit.',
-                    'subtotal_final': 'Subtotal'
-                })
-                st.dataframe(df_show, use_container_width=True)
-
-            st.markdown("---")
-            st.markdown("**Ações:**")
-
-            col_a, col_b, col_c, col_d = st.columns(4)
-
-            with col_a:
-                novo_status = st.selectbox(
-                    "Status",
-                    ["PENDENTE", "APROVADA", "CANCELADA"],
-                    index=["PENDENTE", "APROVADA", "CANCELADA"].index(cot['status']),
-                    key=f"status_{cot['id']}"
-                )
-                if st.button("Atualizar Status", key=f"btn_status_{cot['id']}"):
-                    atualizar_status_cotacao(cot['id'], novo_status, username_rep)
-                    st.rerun()
-
-            with col_b:
-                desconto_input = st.number_input(
-                    "Desconto %",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(cot.get('desconto_percentual', 0)),
-                    step=0.5,
-                    key=f"desc_{cot['id']}"
-                )
-                if st.button("Aplicar Desconto", key=f"btn_desc_{cot['id']}"):
-                    aplicar_desconto_cotacao(cot['id'], desconto_input, username_rep)
-                    st.rerun()
-
-            with col_c:
-                pdf_bytes = gerar_pdf_cotacao(cot, itens, True)
-                st.download_button(
-                    label="Baixar PDF",
-                    data=pdf_bytes,
-                    file_name=f"cotacao_{cot['id']}.pdf",
-                    mime="application/pdf",
-                    key=f"pdf_{cot['id']}"
-                )
-
-# ========================= 
-# PÁGINAS - CLIENTE
-# ========================= 
-def pagina_nova_cotacao(cliente_row):
-    """Interface de criação de cotação pelo cliente"""
-    username_rep = cliente_row.get('representante_id', '')
-
-    if not username_rep:
-        st.error("Cliente não está vinculado a um representante")
-        return
-
-    tabela = load_tabela_geral(username_rep)
-
-    if tabela.empty:
-        st.warning("Nenhuma tabela de preços disponível. Entre em contato com seu representante.")
-        return
-
-    # Buscar cliente na base do representante
-    clientes_df = load_clientes(username_rep)
-    cliente_busca = clientes_df[
-        (clientes_df['CNPJ'] == cliente_row.get('cnpj', '')) | 
-        (clientes_df['TELEFONE'] == cliente_row.get('telefone', ''))
-    ]
-
-    if cliente_busca.empty:
-        st.error("Dados do cliente não encontrados na base do representante")
-        return
-
-    cliente_data = cliente_busca.iloc[0]
-
-    st.subheader("Nova Cotacao de Produtos")
-
-    forma_recebimento = st.radio(
-        "Como deseja receber os produtos?",
-        ["Retirada no centro de distribuição", "Entrega no endereço"]
-    )
-
-    entrega = forma_recebimento == "Entrega no endereço"
-    pode_ver_preco = cliente_pode_ver_preco(cliente_data)
-
-    col_codigo = "Codigo_1" if "Codigo_1" in tabela.columns else "Codigo"
-    col_produto = "Produto_1" if "Produto_1" in tabela.columns else "Produto"
-    col_unidade = "Unidade_1" if "Unidade_1" in tabela.columns else "Unidade"
+def pagina_gestao_clientes(representante_id):
+    """Página de gestão de clientes (Cadastro e Edição)"""
+    st.subheader("👥 Gestão de Clientes")
+    
+    # =========================================================
+    # 1. CADASTRO MANUAL DE NOVO CLIENTE
+    # =========================================================
+    with st.expander("➕ Cadastrar Novo Cliente Manualmente", expanded=False):
+        with st.form("form_novo_cliente"):
+            st.write("Preencha os dados abaixo para cadastrar um cliente individualmente.")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                nome_novo = st.text_input("Nome do Cliente / Razão Social", key="nome_cliente_novo")
+                cnpj_novo = st.text_input("CNPJ (apenas números)", key="cnpj_cliente_novo")
+                telefone_novo = st.text_input("Telefone (com DDD)", key="telefone_cliente_novo")
+            
+            with c2:
+                cidade_novo = st.text_input("Cidade", key="cidade_cliente_novo")
+                distancia_novo = st.number_input("Distância (KM)", min_value=0, value=0, help="Define a tabela de preço automaticamente", key="distancia_cliente_novo")
+                pode_ver_preco_novo = st.toggle("Pode visualizar preços?", value=True)
+            
+            submitted = st.form_submit_button("Cadastrar Cliente")
+            
+            if submitted:
+                if not nome_novo:
+                    st.error("O campo Nome é obrigatório.")
+                elif not (cnpj_novo or telefone_novo):
+                    st.error("É necessário informar ao menos CNPJ ou Telefone.")
+                else:
+                    # --- NOVA LÓGICA DE DISTÂNCIA NO MANUAL ---
+                    dist = int(distancia_novo)
+                    coluna_preco = 'preco_entrega' # Padrão (0-100km)
+                    
+                    if dist < 100: coluna_preco = 'preco_entrega'
+                    elif dist < 200: coluna_preco = 'preco_100a199km'
+                    elif dist < 300: coluna_preco = 'preco_200a299km'
+                    elif dist < 400: coluna_preco = 'preco_300a399km'
+                    elif dist <= 500: coluna_preco = 'preco_acima400km'
+                    elif dist <= 600: coluna_preco = 'preco_acima500km'
+                    else: coluna_preco = 'preco_acima600km'
+                    # -----------------------------------------
+                    
+                    try:
+                        senha_padrao_hash = hash_senha("123456")
+                        
+                        supabase.table('clientes').insert({
+                            'representante_id': representante_id,
+                            'nome': nome_novo.upper(),
+                            'cnpj': so_digitos(cnpj_novo),
+                            'telefone': so_digitos(telefone_novo),
+                            'cidade': cidade_novo,
+                            'distancia_km': dist,
+                            'coluna_preco': coluna_preco,
+                            'visualiza_preco': pode_ver_preco_novo,
+                            'senha_hash': senha_padrao_hash
+                        }).execute()
+                        
+                        st.success(f"✅ Cliente {nome_novo} cadastrado! Faixa de preço definida: {coluna_preco}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao cadastrar: {e}. Verifique se o CNPJ já não existe.")
 
     st.markdown("---")
-    st.subheader("Buscar e adicionar produtos")
+    
+    # =========================================================
+    # 2. LISTAGEM E EDIÇÃO
+    # =========================================================
+    
+    df = carregar_clientes(representante_id)
+    
+    if df.empty:
+        st.info("📋 Nenhum cliente cadastrado ainda")
+        return
+    
+    # Filtro por nome
+    filtro_nome = st.text_input(
+        "🔍 Buscar cliente por nome, CNPJ ou cidade", 
+        "",
+        key="busca_cli_gestao" 
+    )
+    
+    df_view = df.copy()
+    if filtro_nome.strip():
+        termo = filtro_nome.strip().lower()
+        # Filtra em várias colunas
+        df_view = df_view[
+            df_view['nome'].str.lower().str.contains(termo, na=False) | 
+            df_view['cnpj'].str.contains(termo, na=False) |
+            df_view['cidade'].str.lower().str.contains(termo, na=False)
+        ]
+    
+    st.write(f"**Clientes encontrados:** {len(df_view)}")
+    
+    # Cabeçalho visual da tabela
+    st.markdown("""
+    <div style="display: flex; font-weight: bold; padding: 10px 0; border-bottom: 2px solid #ddd;">
+        <div style="flex: 3;">Dados do Cliente</div>
+        <div style="flex: 2;">Permissões</div>
+        <div style="flex: 2;">Ações (Reset Senha)</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    for idx, row in df_view.iterrows():
+        # Usamos container para organizar as linhas
+        with st.container():
+            col1, col2, col3 = st.columns([3, 2, 2])
+            
+            with col1:
+                st.write(f"🏢 **{row['nome']}**")
+                info = []
+                if row.get('cnpj'): info.append(f"CNPJ: {row['cnpj']}")
+                if row.get('telefone'): info.append(f"Tel: {row['telefone']}")
+                info.append(f"{row.get('distancia_km', 0)} km")
+                st.caption(" | ".join(info))
+                
+            with col2:
+                # Toggle de visualização de preço
+                valor_atual = bool(row.get('visualiza_preco', True))
+                novo_valor = st.toggle(
+                    "Ver Preços",
+                    value=valor_atual,
+                    key=f"visupreco_{row['id']}"
+                )
+                
+                # Se mudou o valor, salva imediatamente no banco
+                if novo_valor != valor_atual:
+                    atualizar_visualiza_preco(row['id'], novo_valor)
+                    st.toast(f"Permissão de {row['nome']} atualizada!")
+            
+            with col3:
+                # Botão de Reset de Senha
+                if st.button("🔄 Resetar Senha", key=f"reset_{row['id']}"):
+                    try:
+                        nova_senha_padrao = "123456"
+                        supabase.table('clientes').update({
+                            'senha_hash': hash_senha(nova_senha_padrao)
+                        }).eq('id', row['id']).execute()
+                        
+                        st.success(f"Senha de {row['nome']} resetada para '123456'!")
+                    except Exception as e:
+                        st.error("Erro ao resetar senha.")
+            
+            st.markdown("---")
 
-    if "itens_cotacao" not in st.session_state:
+def pagina_gerenciar_cotacoes(representante_id):
+    """Página para gerenciar cotações"""
+    st.subheader("📋 Gerenciar Cotações")
+    
+    cotacoes = carregar_cotacoes(representante_id)
+    
+    if cotacoes.empty:
+        st.info("📋 Nenhuma cotação registrada ainda")
+        return
+    
+    filtro_status = st.selectbox("Filtrar por status", ["TODAS", "PENDENTE", "APROVADA", "CANCELADA"], key="filtro_status_cotacoes")
+    
+    df_view = cotacoes.copy()
+    if filtro_status != "TODAS":
+        df_view = df_view[df_view['status'] == filtro_status]
+    
+    df_view = df_view.sort_values('created_at', ascending=False)
+    st.write(f"**Total de cotações:** {len(df_view)}")
+    
+    for _, cot in df_view.iterrows():
+        cliente_nome = cot.get('clientes', {}).get('nome', 'N/A') if isinstance(cot.get('clientes'), dict) else 'N/A'
+        telefone = cot.get('clientes', {}).get('telefone', 'N/A') if isinstance(cot.get('clientes'), dict) else 'N/A'
+        
+        data_criacao = cot.get('created_at')
+        if data_criacao:
+            dt_obj = pd.to_datetime(data_criacao)
+            if dt_obj.tzinfo: dt_obj = dt_obj.tz_localize(None)
+            dt_obj = dt_obj - pd.Timedelta(hours=3)
+            data_fmt = dt_obj.strftime('%d/%m/%Y %H:%M')
+        else:
+            data_fmt = 'N/A'
+        
+        # --- CÁLCULOS DETALHADOS PARA VISUALIZAÇÃO ---
+        # Carregamos os itens aqui para poder somar o bruto
+        itens_calc = carregar_itens_cotacao(cot['id'])
+        
+        total_real_bruto = 0.0
+        total_desc_itens = 0.0
+        total_desc_extra = 0.0
+        total_final = float(cot.get('total_final', 0))
+        
+        if not itens_calc.empty:
+            # Calcula o bruto (sem desconto) linha a linha
+            itens_calc['bruto_item'] = itens_calc['preco_unitario'] * itens_calc['quantidade']
+            total_real_bruto = itens_calc['bruto_item'].sum()
+            
+            # O que está salvo em 'total_original' na cotação é a soma dos subtotais (já com desc. item)
+            soma_subtotais = float(cot.get('total_original', 0))
+            
+            # Diferenças
+            total_desc_itens = total_real_bruto - soma_subtotais
+            total_desc_extra = soma_subtotais - total_final
+        # ---------------------------------------------
+
+        with st.expander(f"📄 Cotação {cot['id']} - {cliente_nome} - {cot['status']}", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Cliente:** {cliente_nome}")
+                st.markdown(f"**Data:** {data_fmt}")
+                st.markdown(f"**Entrega:** {cot.get('forma_recebimento', 'N/A')}")
+            
+            with col2:
+                # --- VISUALIZAÇÃO SOLICITADA ---
+                st.metric("Total Final", f"R$ {total_final:,.2f}")
+                
+                # Exibição detalhada em HTML pequeno ou Caption
+                st.markdown(f"""
+                <div style="font-size: 12px; color: #555;">
+                <b>Total Real (Sem descontos):</b> R$ {total_real_bruto:,.2f}<br>
+                <span style="color: #d9534f;">▼ Desc. nos Itens: R$ {total_desc_itens:,.2f}</span><br>
+                <span style="color: #d9534f;">▼ Desc. Extra ({cot.get('desconto_geral_percentual', 0)}%): R$ {total_desc_extra:,.2f}</span>
+                </div>
+                """, unsafe_allow_html=True)
+                # -------------------------------
+                
+            st.markdown("---")
+            
+            st.markdown("**📦 Editor de Itens e Descontos**")
+            # Usamos o dataframe que já carregamos lá em cima
+            itens = itens_calc
+            
+            if not itens.empty:
+                df_edit = itens.copy()
+                if 'desconto_percentual' not in df_edit.columns: df_edit['desconto_percentual'] = 0.0
+                df_edit['desconto_percentual'] = df_edit['desconto_percentual'].fillna(0.0).astype(float)
+                
+                df_edit = df_edit[['codigo', 'produto', 'quantidade', 'preco_unitario', 'desconto_percentual', 'subtotal']]
+                df_edit = df_edit.rename(columns={
+                    'codigo': 'Código', 'produto': 'Produto', 'quantidade': 'Qtde',
+                    'preco_unitario': 'Preço Unit.', 'desconto_percentual': 'Desconto (%)', 'subtotal': 'Subtotal'
+                })
+                
+                df_editado = st.data_editor(
+                    df_edit,
+                    column_config={
+                        "Código": st.column_config.TextColumn(disabled=True, width="small"),
+                        "Produto": st.column_config.TextColumn(disabled=True, width="medium"), 
+                        "Qtde": st.column_config.NumberColumn(disabled=True, width="small"),
+                        "Preço Unit.": st.column_config.NumberColumn(format="R$ %.2f", disabled=True, width="small"),
+                        "Subtotal": st.column_config.NumberColumn(format="R$ %.2f", disabled=True, width="small"),
+                        "Desconto (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.5, format="%.1f%%", width="small")
+                    },
+                    hide_index=True, width='stretch', key=f"editor_{cot['id']}"
+                )
+                
+                c_desc, c_save = st.columns([1, 2])
+                with c_desc:
+                    desc_geral = float(cot.get('desconto_geral_percentual', 0))
+                    novo_desconto_geral = st.number_input("Desconto Extra no Total (%)", min_value=0.0, max_value=100.0, value=desc_geral, step=0.5, key=f"desc_geral_{cot['id']}")
+                with c_save:
+                    st.write("")
+                    st.write("")
+                    if st.button("💾 Salvar Tudo", type="primary", key=f"btn_save_all_{cot['id']}"):
+                        sucesso = recalcular_e_salvar_itens(cot['id'], df_editado, novo_desconto_geral)
+                        if sucesso:
+                            st.success("Cotação recalculada e salva com sucesso!")
+                            st.rerun()
+            else:
+                st.warning("⚠️ Esta cotação não possui itens registrados.")
+                if st.button("🗑️ Excluir esta cotação vazia", key=f"btn_del_cot_{cot['id']}"):
+                    supabase.table('cotacoes').delete().eq('id', cot['id']).execute()
+                    st.success("Cotação excluída.")
+                    st.rerun()
+
+            st.markdown("---")
+            c_status, c_acoes = st.columns([1, 1])
+            
+            with c_status:
+                st.markdown("**Alterar Status**")
+                status_opcoes = ["PENDENTE", "APROVADA", "CANCELADA"]
+                idx_atual = status_opcoes.index(cot['status']) if cot['status'] in status_opcoes else 0
+                col_st_1, col_st_2 = st.columns([2, 1])
+                with col_st_1:
+                    novo_status = st.selectbox("Status", status_opcoes, index=idx_atual, key=f"status_{cot['id']}", label_visibility="collapsed")
+                with col_st_2:
+                    if st.button("Atualizar", key=f"btn_status_{cot['id']}"):
+                        atualizar_status_cotacao(cot['id'], novo_status)
+                        st.rerun()
+            
+            with c_acoes:
+                st.markdown("**Ações**")
+                col_ac_1, col_ac_2 = st.columns(2)
+                with col_ac_1:
+                    pdf_bytes = gerar_pdf_cotacao(cot['id'], True)
+                    st.download_button(label="📄 Baixar PDF", data=pdf_bytes, file_name=f"cotacao_{cot['id']}.pdf", mime="application/pdf", key=f"pdf_{cot['id']}")
+                with col_ac_2:
+                    if telefone and telefone != "N/A":
+                        tel_limpo = so_digitos(telefone)
+                        if tel_limpo:
+                            texto_msg = f"Olá! Estou analisando sua cotação *{cot['id']}*."
+                            link_whats = f"https://wa.me/55{tel_limpo}?text={texto_msg}"
+                            st.link_button(label="💬 WhatsApp", url=link_whats, type="secondary")
+
+def pagina_representante():
+    """Página principal do representante"""
+    local_css()
+    
+    if 'representante_logado' not in st.session_state:
+        st.session_state.representante_logado = None
+    
+    if st.session_state.representante_logado is None:
+        # Tela de login/cadastro
+        col_esq, col_centro, col_dir = st.columns([1, 2, 1])
+        
+        with col_centro:
+            st.markdown('<div class="main-header">Área do Representante</div>', unsafe_allow_html=True)
+            st.markdown("Acesse o sistema ou crie um cadastro.", unsafe_allow_html=True)
+            
+            tab1, tab2 = st.tabs(["Login", "Novo Cadastro"])
+            
+            with tab1:
+                st.subheader("Acesse o sistema")
+                login_email = st.text_input("E-mail", key="rep_email")
+                login_senha = st.text_input("Senha", type="password", key="rep_senha")
+                st.write("")
+                
+                if st.button("ENTRAR", key="btn_rep_login"):
+                    if login_email and login_senha:
+                        usuario, msg = autenticar_representante(login_email, login_senha)
+                        if usuario is not None:
+                            st.session_state.representante_logado = usuario
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.warning("Preencha todos os campos")
+            
+            with tab2:
+                st.subheader("Cadastro de Novo Representante")
+                st.warning("⚠️ Para criar uma conta, você precisa do Token de Autorização da empresa.")
+                
+                with st.form("form_novo_rep"):
+                    nome_rep = st.text_input("Seu Nome Completo", key="nome_rep_cadastro")
+                    email_rep = st.text_input("Seu E-mail", key="email_rep_cadastro")
+                    telefone_rep = st.text_input("Seu Telefone (opcional)", key="telefone_rep_cadastro")
+                    user_rep = st.text_input("Crie um Usuário (Login)", key="user_rep_cadastro")
+                    pass_rep = st.text_input("Crie uma Senha", type="password", key="pass_rep_cadastro")
+                    pass_rep_conf = st.text_input("Confirme a Senha", type="password", key="pass_rep_confirm")
+                    token_seguranca = st.text_input("Token de Admin", type="password", help="Digite o Token recebido na contratação", key="token_admin_cadastro")
+                    
+                    submit_novo_rep = st.form_submit_button("CADASTRAR")
+                    
+                    if submit_novo_rep:
+                        if token_seguranca != TOKEN_ADMIN:
+                            st.error("❌ Token de Admin inválido! Cadastro não permitido.")
+                        elif not (nome_rep and email_rep and pass_rep):
+                            st.error("❌ Preencha todos os campos obrigatórios.")
+                        elif pass_rep != pass_rep_conf:
+                            st.error("❌ As senhas não coincidem.")
+                        else:
+                            sucesso, msg = cadastrar_representante(nome_rep, email_rep, pass_rep, telefone_rep)
+                            if sucesso:
+                                st.success("✅ Conta criada com sucesso! Faça login na outra aba.")
+                            else:
+                                st.error(msg)
+        return
+    
+    # Representante logado
+    rep = st.session_state.representante_logado
+    representante_id = rep['id']
+    
+    st.sidebar.title(f"Olá, {rep.get('nome', 'Representante')}!")
+    menu = st.sidebar.radio(
+        "Menu",
+        ["Dashboard", "Importar Tabela de Preços", "Importar Clientes", "Gestão de Clientes", "Gerenciar Cotações"]
+    )
+    
+    if st.sidebar.button("Sair"):
+        st.session_state.representante_logado = None
+        st.rerun()
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("""
+    <small style='color: white; font-size: 10px; opacity: 0.7;'>
+    Contato e Suporte<br>
+    atendimento@beccai.com.br<br>
+    (11) 95451.9325<br>
+    Desenvolvido por www.beccai.com.br<br>
+    ---<br>
+    Versão 2.0 | Janeiro 2026
+    </small>
+    """, unsafe_allow_html=True)
+    
+    if menu == "Dashboard":
+        pagina_dashboard(representante_id)
+    elif menu == "Importar Tabela de Preços":
+        pagina_upload_tabela_precos(representante_id)
+    elif menu == "Importar Clientes":
+        pagina_upload_clientes(representante_id)
+    elif menu == "Gestão de Clientes":
+        pagina_gestao_clientes(representante_id)
+    elif menu == "Gerenciar Cotações":
+        pagina_gerenciar_cotacoes(representante_id)
+
+# =====================================================================
+# PÁGINAS DA APLICAÇÃO - CLIENTE
+# =====================================================================
+
+def pagina_nova_cotacao(cliente):
+    """Interface de criação de cotação pelo cliente"""
+    representante_id = cliente['representante_id']
+
+    # --- NOVO: Exibir mensagem de cotação enviada ---
+    if "msg_sucesso_envio" in st.session_state:
+        st.success(st.session_state["msg_sucesso_envio"])
+        del st.session_state["msg_sucesso_envio"] # Apaga para não mostrar de novo
+    # -----------------------------------------------
+
+    # --- CALLBACKS (Funções que rodam ANTES da tela recarregar) ---
+    def add_item_callback(novo_item):
+        st.session_state["itens_cotacao"].append(novo_item)
+        # Limpa os campos com segurança
+        st.session_state["busca_produto"] = ""
+        st.session_state["qtd_add"] = 1
+        if "select_produto" in st.session_state:
+            del st.session_state["select_produto"]
+        # Sinaliza sucesso para mostrar mensagem depois
+        st.session_state["msg_sucesso"] = "Item adicionado com sucesso!"
+
+    def limpar_tudo_callback():
         st.session_state["itens_cotacao"] = []
+        st.session_state["busca_produto"] = ""
+        st.session_state["qtd_add"] = 1
+        if "select_produto" in st.session_state:
+            del st.session_state["select_produto"]
+    # -------------------------------------------------------------
 
+    st.subheader("🛒 Nova Cotação de Produtos")
+    
+    # Exibir mensagem de sucesso se houver (vindo do callback)
+    if "msg_sucesso" in st.session_state:
+        st.success(st.session_state["msg_sucesso"])
+        del st.session_state["msg_sucesso"] # Remove para não aparecer de novo
+
+    # Forma de recebimento
+    forma_recebimento = st.radio(
+        "Como deseja receber os produtos?",
+        ["Retirada no centro de distribuição", "Entrega no endereço"],
+        key="forma_recebimento_cotacao"
+    )
+    
+    pode_ver_preco = bool(cliente.get('visualiza_preco', True))
+    coluna_preco = cliente.get('coluna_preco', 'preco_100a199km')
+    
+    st.markdown("---")
+    st.subheader("🔍 Buscar e adicionar produtos")
+    
+    # Inicializar carrinho na sessão
+    if 'itens_cotacao' not in st.session_state:
+        st.session_state.itens_cotacao = []
+    
+    # Busca de produtos
     termo_busca = st.text_input(
-        "Digite ao menos 3 caracteres do código ou nome do produto:",
+        "Digite ao menos 3 caracteres do código ou nome do produto",
         key="busca_produto"
     )
-
+    
     if termo_busca and len(termo_busca.strip()) >= 3:
-        termo_lower = termo_busca.lower().strip()
-        termo_normalized = unidecode(termo_lower)
-        df_view = tabela[
-            tabela[col_produto].astype(str).str.lower().apply(unidecode).str.contains(termo_normalized) |
-            tabela[col_codigo].astype(str).str.lower().apply(unidecode).str.contains(termo_normalized)
-        ].copy()
-        df_view = df_view.head(20)
-
-        if df_view.empty:
+        df_produtos = buscar_produtos(representante_id, termo_busca.strip())
+        
+        if df_produtos.empty:
             st.warning("Nenhum produto encontrado")
         else:
-            opcoes = df_view.apply(
-                lambda row: f"{row[col_codigo]} - {row[col_produto]}",
+            opcoes = df_produtos.apply(
+                lambda row: f"{row['codigo']} - {row['produto']}",
                 axis=1
             ).tolist()
-
+            
             escolha = st.selectbox(
-                "Selecione um produto:",
-                [""] + opcoes,
+                "Clique abaixo e escolha um produto da lista",
+                opcoes,
                 key="select_produto"
             )
-
+            
             if escolha:
-                codigo_escolhido = escolha.split(" - ")[0]
-                produto_sel = df_view[df_view[col_codigo] == codigo_escolhido].iloc[0]
+                codigo_escolhido = escolha.split(' - ')[0]
+                produto_sel = df_produtos[df_produtos['codigo'] == codigo_escolhido].iloc[0]
+                
+                # Dados básicos
+                preco_retira = produto_sel.get('preco_retira')
+                id_produto_banco = produto_sel.get('id') or produto_sel.get('ID') or produto_sel.get('Id')
 
-                preco_retira = get_preco_retira(produto_sel)
-                preco_entrega = get_preco_entrega(cliente_data, produto_sel)
-
-                if entrega:
-                    preco_final = preco_entrega if preco_entrega is not None else preco_retira
-                else:
-                    preco_final = preco_retira
-
-                st.markdown("### Detalhes do produto")
-                st.write(f"**Código:** {produto_sel[col_codigo]}")
-                st.write(f"**Produto:** {produto_sel[col_produto]}")
-                st.write(f"**Unidade:** {produto_sel[col_unidade]}")
-
+                # Calcular preço
+                preco_final = get_preco_produto(produto_sel, coluna_preco, forma_recebimento)
+                
+                st.markdown("**Detalhes do produto:**")
+                st.write(f"Código: {produto_sel['codigo']}")
+                st.write(f"Produto: {produto_sel['produto']}")
+                st.write(f"Unidade: {produto_sel['unidade']}")
+                
                 if pode_ver_preco:
-                    if preco_retira is not None:
-                        st.write(f"**Preço para retirada:** R$ {preco_retira:.2f}")
-                    if entrega and preco_entrega is not None:
-                        st.write(f"**Preço com frete:** R$ {preco_entrega:.2f}")
+                    if forma_recebimento == 'Retirada no centro de distribuição':
+                        if preco_retira:
+                            st.write(f"Preço para retirada: R$ {float(preco_retira):.2f}")
+                    else:
+                        if preco_final:
+                            st.write(f"Preço com frete: R$ {float(preco_final):.2f}")
                 else:
                     st.info("Os preços serão calculados e enviados pelo representante.")
+                
+                qtd = st.number_input("Quantidade", min_value=1, value=1, step=1, key="qtd_add")
+                
+                # --- PREPARAÇÃO DOS DADOS ANTES DO BOTÃO ---
+                if not id_produto_banco:
+                    st.error("ERRO: Produto sem ID. Recarregue a página.")
+                else:
+                    val_final = float(preco_final) if preco_final is not None else 0.0
+                    subtotal_retira = (float(preco_retira) * qtd) if preco_retira is not None else 0.0
+                    subtotal_final = val_final * qtd
+                    
+                    # Criamos o dicionário do item AQUI, para passar pro botão
+                    item_para_adicionar = {
+                        "produto_id": id_produto_banco,
+                        "codigo": produto_sel['codigo'],
+                        "produto": produto_sel['produto'],
+                        "unidade": produto_sel['unidade'],
+                        "quantidade": qtd,
+                        "preco_retira": float(preco_retira) if preco_retira is not None else 0.0,
+                        "preco_final": val_final,
+                        "subtotal_retira": subtotal_retira,
+                        "subtotal_final": subtotal_final,
+                    }
 
-                qtd = st.number_input(
-                    "Quantidade",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="qtd_add"
-                )
-
-                if st.button("+ Adicionar à cotação", key="btn_add_produto"):
-                    if preco_final is None:
-                        st.error("Produto sem preço disponível")
-                    else:
-                        subtotal_retira = preco_retira * qtd if preco_retira is not None else 0.0
-                        subtotal_final = preco_final * qtd
-
-                        st.session_state["itens_cotacao"].append({
-                            "codigo": produto_sel[col_codigo],
-                            "produto": produto_sel[col_produto],
-                            "unidade": produto_sel[col_unidade],
-                            "quantidade": qtd,
-                            "preco_retira": preco_retira if preco_retira is not None else 0.0,
-                            "preco_final": preco_final,
-                            "subtotal_retira": subtotal_retira,
-                            "subtotal_final": subtotal_final,
-                        })
-                        st.success("Item adicionado!")
-                        st.rerun()
+                    # --- BOTÃO COM CALLBACK (Correção do erro) ---
+                    st.button(
+                        "+ Adicionar à cotação", 
+                        key="btn_add_produto",
+                        on_click=add_item_callback,  # Chama a função de limpeza
+                        args=(item_para_adicionar,)  # Passa os dados
+                    )
 
     elif termo_busca:
         st.info("Digite pelo menos 3 caracteres")
@@ -1142,29 +1711,36 @@ def pagina_nova_cotacao(cliente_row):
                 st.write(item["produto"])
 
             with col3:
+                # Mudamos a KEY para incluir o código do produto. 
+                # Assim ela fica única e não se confunde se a ordem mudar.
                 nova_qtd = st.number_input(
                     "Qtde",
                     min_value=1,
                     value=int(item["quantidade"]),
                     step=1,
-                    key=f"qtd_{idx}",
+                    key=f"qtd_{item['codigo']}_{idx}", # <--- CORREÇÃO
                     label_visibility="collapsed"
                 )
                 if nova_qtd != item["quantidade"]:
                     st.session_state["itens_cotacao"][idx]["quantidade"] = nova_qtd
+                    # Atualiza subtotais ao mudar quantidade na lista
                     st.session_state["itens_cotacao"][idx]["subtotal_retira"] = item["preco_retira"] * nova_qtd
                     st.session_state["itens_cotacao"][idx]["subtotal_final"] = item["preco_final"] * nova_qtd
                     st.rerun()
 
             with col4:
                 if pode_ver_preco:
-                    st.write(f"R$ {item['preco_final']:.2f}")
+                    # Verifica qual preço mostrar
+                    preco_show = item['preco_retira'] if forma_recebimento == 'Retirada no centro de distribuição' else item['preco_final']
+                    st.write(f"R$ {preco_show:.2f}")
                 else:
                     st.write("-")
 
             with col5:
                 if pode_ver_preco:
-                    st.write(f"R$ {item['subtotal_final']:.2f}")
+                    # Verifica qual subtotal mostrar
+                    sub_show = item['subtotal_retira'] if forma_recebimento == 'Retirada no centro de distribuição' else item['subtotal_final']
+                    st.write(f"R$ {sub_show:.2f}")
                 else:
                     st.write("-")
 
@@ -1176,8 +1752,13 @@ def pagina_nova_cotacao(cliente_row):
         st.markdown("---")
 
         if pode_ver_preco:
-            total_final = sum(item["subtotal_final"] for item in itens)
-            st.markdown(f"### Total: R$ {total_final:.2f}")
+            # Calcula total baseado na escolha atual
+            if forma_recebimento == 'Retirada no centro de distribuição':
+                total_final = sum(item["subtotal_retira"] for item in itens)
+            else:
+                total_final = sum(item["subtotal_final"] for item in itens)
+                
+            st.markdown(f"### Total Estimado: R$ {total_final:.2f}")
         else:
             st.info("Os valores totais desta cotação serão calculados e enviados pelo representante.")
 
@@ -1185,205 +1766,225 @@ def pagina_nova_cotacao(cliente_row):
 
         with col1:
             if st.button("Enviar Cotação", type="primary", key="btn_enviar"):
-                id_cot = salvar_cotacao(cliente_data, itens, forma_recebimento, username_rep)
+                
+                # Preparação dos dados para envio
+                itens_para_salvar = []
+                for item in itens:
+                    item_pronto = item.copy()
+                    
+                    if forma_recebimento == 'Retirada no centro de distribuição':
+                        item_pronto['preco_unitario'] = item['preco_retira']
+                        item_pronto['subtotal'] = item['subtotal_retira']
+                    else:
+                        item_pronto['preco_unitario'] = item['preco_final']
+                        item_pronto['subtotal'] = item['subtotal_final']
+                    
+                    itens_para_salvar.append(item_pronto)
+                
+                id_cot = salvar_cotacao(
+                    cliente['representante_id'], 
+                    cliente['id'], 
+                    cliente['nome'], 
+                    itens_para_salvar,
+                    forma_recebimento
+                )
+                
                 if id_cot:
-                    st.success(f"Cotação enviada! ID: {id_cot}")
+                    # Guardamos a mensagem na sessão para ela sobreviver ao rerun
+                    st.session_state["msg_sucesso_envio"] = f"✅ Cotação enviada com sucesso! ID: {id_cot}. Acompanhe em 'Meus Pedidos'."
                     st.session_state["itens_cotacao"] = []
                     st.rerun()
 
         with col2:
-            if st.button("Limpar Tudo", key="btn_limpar"):
-                st.session_state["itens_cotacao"] = []
-                st.rerun()
+            # --- BOTÃO LIMPAR COM CALLBACK (Correção do erro) ---
+            st.button("Limpar Tudo", key="btn_limpar", on_click=limpar_tudo_callback)
+
     else:
         st.info("Nenhum item adicionado ainda. Busque produtos acima.")
 
-def pagina_meus_pedidos(cliente_logado):
+def pagina_meus_pedidos(cliente):
     """Mostra histórico de pedidos do cliente"""
-    st.subheader("Meus Pedidos")
-
-    username_rep = cliente_logado.get('representante_id', '')
-
-    if not username_rep:
-        st.error("Cliente não está vinculado a um representante")
-        return
-
-    # Buscar cliente na base do representante
-    clientes_df = load_clientes(username_rep)
-    cliente_busca = clientes_df[
-        (clientes_df['CNPJ'] == cliente_logado.get('cnpj', '')) | 
-        (clientes_df['TELEFONE'] == cliente_logado.get('telefone', ''))
-    ]
-
-    if cliente_busca.empty:
-        st.error("Dados do cliente não encontrados na base do representante")
-        return
-
-    cliente_data = cliente_busca.iloc[0]
-    pode_ver_preco = cliente_pode_ver_preco(cliente_data)
-
-    cotacoes = load_cotacoes(username_rep)
-    itens_cot = load_itens_cotacao(username_rep)
-
-    tel_cliente = so_digitos(str(cliente_logado.get('telefone', '')))
-    cotacoes['TEL_limp'] = cotacoes['cliente_telefone'].apply(so_digitos)
-
-    minhas_cotacoes = cotacoes[
-        (cotacoes['cliente_nome'] == cliente_logado.get('nome', '')) |
-        (cotacoes['TEL_limp'] == tel_cliente)
-    ].sort_values('data', ascending=False)
-
-    if minhas_cotacoes.empty:
+    st.subheader("📦 Meus Pedidos")
+    
+    # 1. Pegamos a permissão geral do perfil do cliente
+    permissao_geral_perfil = bool(cliente.get('visualiza_preco', True)) 
+    
+    cotacoes = carregar_cotacoes_cliente(cliente['id'])
+    
+    if cotacoes.empty:
         st.info("Você ainda não tem pedidos")
         return
-
-    st.write(f"**Total de pedidos:** {len(minhas_cotacoes)}")
-
-    for idx, (_, cot) in enumerate(minhas_cotacoes.iterrows()):
-        with st.expander(f"Pedido {cot['id']} - {cot['data']} - Status: {cot['status']}", expanded=(idx==0)):
+    
+    st.write(f"**Total de pedidos:** {len(cotacoes)}")
+    
+    for idx, (_, cot) in enumerate(cotacoes.iterrows()):
+        
+        # 2. DEFINIÇÃO DA REGRA DE VISUALIZAÇÃO PARA ESTA COTAÇÃO ESPECÍFICA
+        # O cliente vê o preço se tiver permissão geral OU se a cotação já estiver APROVADA
+        status_aprovada = cot['status'] == 'APROVADA'
+        mostrar_precos_nesta_cotacao = permissao_geral_perfil or status_aprovada # <--- Lógica corrigida aqui
+        
+        with st.expander(
+            f"📄 Pedido {cot['id']} - {cot['created_at'][:10] if cot.get('created_at') else ''} - Status: {cot['status']}",
+            expanded=(idx == 0)
+        ):
             col1, col2 = st.columns(2)
-
+            
             with col1:
                 st.write(f"**Forma de recebimento:** {cot.get('forma_recebimento', 'N/A')}")
-                st.write(f"**Status:** {cot['status']}")
-
+                
+                # Destacar o status visualmente
+                if cot['status'] == 'APROVADA':
+                    st.success(f"**Status:** {cot['status']}")
+                elif cot['status'] == 'PENDENTE':
+                    st.warning(f"**Status:** {cot['status']}")
+                else:
+                    st.error(f"**Status:** {cot['status']}")
+            
             with col2:
-                if pode_ver_preco:
+                # 3. Usamos a variável específica da cotação, não mais a geral
+                if mostrar_precos_nesta_cotacao:
                     try:
-                        total_orig = float(cot.get('total_original', cot['total']))
-                        desconto = float(cot.get('desconto_percentual', 0))
-                        total_final = float(cot['total'])
+                        total_orig = float(cot.get('total_original', 0))
+                        desconto = float(cot.get('desconto_geral_percentual', 0))
+                        total_final = float(cot.get('total_final', 0))
                     except (ValueError, TypeError):
                         total_orig = total_final = 0
                         desconto = 0
-
+                    
                     st.write(f"**Total original:** R$ {total_orig:.2f}")
                     if desconto > 0:
                         st.write(f"**Desconto:** {desconto:.1f}%")
                     st.write(f"**Total final:** R$ {total_final:.2f}")
                 else:
-                    st.info("Os valores totais deste pedido serão informados pelo representante.")
+                    st.info("Aguardando aprovação do representante para exibir valores finais.")
 
-            itens = itens_cot[itens_cot['id_cotacao'] == cot['id']]
+            # Itens
+            itens = carregar_itens_cotacao(cot['id'])
             if not itens.empty:
                 st.markdown("**Itens:**")
+                
                 df_show = itens[['codigo', 'produto', 'quantidade']].copy()
-                if pode_ver_preco:
-                    df_show['preco_final'] = itens['preco_final']
-                    df_show['subtotal_final'] = itens['subtotal_final']
+                
+                # 4. Controla visualização na tabela de itens
+                if mostrar_precos_nesta_cotacao:
+                    df_show['preco_unitario'] = itens['preco_unitario']
+                    df_show['subtotal'] = itens['subtotal']
                 else:
-                    df_show['preco_final'] = '-'
-                    df_show['subtotal_final'] = '-'
+                    df_show['preco_unitario'] = '-'
+                    df_show['subtotal'] = '-'
+                
                 df_show = df_show.rename(columns={
                     'codigo': 'Código',
                     'produto': 'Produto',
                     'quantidade': 'Qtde',
-                    'preco_final': 'Preço Unit.',
-                    'subtotal_final': 'Subtotal'
+                    'preco_unitario': 'Preço Unit.',
+                    'subtotal': 'Subtotal'
                 })
-                st.dataframe(df_show, use_container_width=True)
-
-            pdf_bytes = gerar_pdf_cotacao(cot, itens, pode_ver_preco)
+                
+                st.dataframe(df_show, width='stretch')
+            
+            # 5. Controla visualização no PDF
+            pdf_bytes = gerar_pdf_cotacao(cot['id'], mostrar_precos_nesta_cotacao)
             st.download_button(
-                label="Baixar PDF",
+                label="📄 Baixar PDF",
                 data=pdf_bytes,
                 file_name=f"pedido_{cot['id']}.pdf",
                 mime="application/pdf",
-                key=f"pdf_{cot['id']}"
+                key=f"pdf_cliente_{cot['id']}"
             )
+            st.markdown("---")
+            
+            # Botão WhatsApp Melhorado
+            try:
+                rep_data = supabase.table('representantes').select('telefone, nome').eq('id', cliente['representante_id']).single().execute()
+                tel_rep = rep_data.data.get('telefone')
+                nome_rep = rep_data.data.get('nome', 'Representante')
+                
+                if tel_rep:
+                    tel_limpo = so_digitos(tel_rep)
+                    if tel_limpo:
+                        # Mensagem mais completa
+                        texto_msg = f"Olá {nome_rep}! Sou {cliente['nome']}. Gostaria de falar sobre o pedido *{cot['id']}*."
+                        link_whats = f"https://wa.me/55{tel_limpo}?text={texto_msg}"
+                        
+                        st.link_button(
+                            label="📲 Falar com Representante", 
+                            url=link_whats,
+                            type="secondary", # Ou 'primary' se quiser destaque
+                            help=f"Envia mensagem para {nome_rep} sobre este pedido"
+                        )
+            except Exception as e:
+                # Se der erro ao buscar telefone, apenas ignora
+                pass
 
 def pagina_cliente():
-    """Página principal do cliente com Login"""
+    """Página principal do cliente"""
     local_css()
-
+    
     if 'cliente_logado' not in st.session_state:
-        st.session_state['cliente_logado'] = None
-
-    if st.session_state['cliente_logado'] is None:
+        st.session_state.cliente_logado = None
+    
+    if st.session_state.cliente_logado is None:
+        # Tela de login/cadastro
         col_esq, col_centro, col_dir = st.columns([1, 2, 1])
-
+        
         with col_centro:
-            st.markdown('<div class="main-header">🛒 Área do Cliente</div>', unsafe_allow_html=True)
-            st.markdown('Faça login ou cadastre sua senha.', unsafe_allow_html=True)
-
-            tab1, tab2 = st.tabs(["Login", "Primeiro Acesso (Criar Senha)"])
-
+            st.markdown('<div class="main-header">Área do Cliente</div>', unsafe_allow_html=True)
+            st.markdown("Faça login ou cadastre sua senha.", unsafe_allow_html=True)
+            
+            tab1, tab2 = st.tabs(["Login", "Primeiro Acesso / Criar Senha"])
+            
             with tab1:
                 st.subheader("Acesse sua conta")
-                login_username = st.text_input("Usuário", key="login_user")
+                login_cnpj_tel = st.text_input("CNPJ ou Telefone", key="login_cnpj")
                 login_senha = st.text_input("Senha", type="password", key="login_pass")
                 st.write("")
-
+                
                 if st.button("ENTRAR", key="btn_login"):
-                    if login_username and login_senha:
-                        usuario, msg = autenticar_cliente(login_username, login_senha)
-                        if usuario is not None:
-                            st.session_state['cliente_logado'] = usuario
+                    if login_cnpj_tel and login_senha:
+                        cliente, msg = autenticar_cliente(login_cnpj_tel, login_senha)
+                        if cliente is not None:
+                            st.session_state.cliente_logado = cliente
                             st.success(msg)
                             st.rerun()
                         else:
                             st.error(msg)
                     else:
                         st.warning("Preencha todos os campos")
-
+            
             with tab2:
                 st.subheader("Crie sua senha")
                 st.info("Use seu CNPJ ou Telefone cadastrado pelo representante para validar.")
-
-                cad_cnpj_tel = st.text_input("CNPJ ou Telefone", key="cad_identificador", placeholder="Digite apenas números")
-
+                
+                cad_cnpj_tel = st.text_input(
+                    "CNPJ ou Telefone",
+                    key="cad_identificador",
+                    placeholder="Digite apenas números"
+                )
+                
                 if cad_cnpj_tel:
-                    # Buscar em todos os representantes
-                    representantes = load_usuarios_representantes()
-                    cliente_encontrado = None
-                    rep_encontrado = None
-
-                    id_digitos = so_digitos(cad_cnpj_tel)
-
-                    for _, rep in representantes.iterrows():
-                        try:
-                            clientes = load_clientes(rep['username'])
-                            if not clientes.empty:
-                                clientes['CNPJ_limp'] = clientes['CNPJ'].apply(so_digitos)
-                                clientes['TEL_limp'] = clientes['TELEFONE'].apply(so_digitos)
-
-                                match = clientes[
-                                    (clientes['CNPJ_limp'] == id_digitos) |
-                                    (clientes['TEL_limp'] == id_digitos)
-                                ]
-
-                                if not match.empty:
-                                    cliente_encontrado = match.iloc[0]
-                                    rep_encontrado = rep['username']
-                                    break
-                        except:
-                            continue
-
+                    cliente_encontrado, rep_id = buscar_cliente_para_cadastro(cad_cnpj_tel)
+                    
                     if cliente_encontrado is not None:
-                        st.success(f"Olá, {cliente_encontrado['NOME']}!")
+                        st.success(f"Olá, {cliente_encontrado['nome']}!")
+                        
                         st.markdown("---")
-
+                        
                         with st.form("form_cad_senha_cliente"):
-                            cad_username = st.text_input("Crie seu Usuário de acesso")
-                            cad_senha = st.text_input("Crie sua Senha", type="password")
-                            cad_senha_confirm = st.text_input("Confirme sua Senha", type="password")
+                            cad_senha = st.text_input("Crie sua Senha", type="password", key="senha_cliente_cadastro")
+                            cad_senha_confirm = st.text_input("Confirme sua Senha", type="password", key="senha_cliente_confirm")
+                            
                             submit_cad = st.form_submit_button("CRIAR CONTA")
-
+                            
                             if submit_cad:
-                                if cad_username and cad_senha and cad_senha_confirm:
+                                if cad_senha and cad_senha_confirm:
                                     if cad_senha != cad_senha_confirm:
                                         st.error("As senhas não coincidem")
                                     elif len(cad_senha) < 6:
                                         st.error("A senha deve ter pelo menos 6 caracteres")
                                     else:
-                                        sucesso, msg = salvar_usuario_cliente(
-                                            username=cad_username,
-                                            nome=cliente_encontrado['NOME'],
-                                            senha=cad_senha,
-                                            cnpj=str(cliente_encontrado.get('CNPJ', '')),
-                                            telefone=str(cliente_encontrado.get('TELEFONE', '')),
-                                            representante_id=rep_encontrado
-                                        )
+                                        sucesso, msg = criar_senha_cliente(cliente_encontrado['id'], cad_senha)
                                         if sucesso:
                                             st.balloons()
                                             st.success(msg + " Vá para a aba Login e entre agora!")
@@ -1393,190 +1994,52 @@ def pagina_cliente():
                                     st.warning("Preencha todos os campos")
                     else:
                         st.error("Cliente não encontrado. Verifique com seu representante.")
-
+        
         return
-
+    
     # Cliente logado
-    cliente = st.session_state['cliente_logado']
-
-    st.sidebar.title(f"Olá, {cliente.get('nome', 'Cliente')}! 👋")
-
-    menu = st.sidebar.radio(
-        "Menu",
-        ["Nova Cotação", "Meus Pedidos"]
-    )
-
+    cliente = st.session_state.cliente_logado
+    
+    st.sidebar.title(f"Olá, {cliente.get('nome', 'Cliente')}!")
+    menu = st.sidebar.radio("Menu", ["Nova Cotação", "Meus Pedidos"])
+    
     if st.sidebar.button("Sair"):
-        st.session_state['cliente_logado'] = None
+        st.session_state.cliente_logado = None
         st.rerun()
-
-    # Footer com informações de contato
+    
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
     <small style='color: white; font-size: 10px; opacity: 0.7;'>
-    **Contato e Suporte:**<br>
-    📧 atendimento@beccai.com.br<br>
-    📞 (11) 95451.9325<br>
-    💻 Desenvolvido por www.beccai.com.br<br>
+    Contato e Suporte<br>
+    atendimento@beccai.com.br<br>
+    (11) 95451.9325<br>
+    Desenvolvido por www.beccai.com.br<br>
     ---<br>
-    **Versão 1.0** | Janeiro 2026
+    Versão 2.0 | Janeiro 2026
     </small>
     """, unsafe_allow_html=True)
-
+    
     if menu == "Nova Cotação":
         pagina_nova_cotacao(cliente)
     elif menu == "Meus Pedidos":
         pagina_meus_pedidos(cliente)
 
-def pagina_representante():
-    """Página principal do representante"""
-    local_css()
+# =====================================================================
+# MAIN
+# =====================================================================
 
-    if 'representante_logado' not in st.session_state:
-        st.session_state['representante_logado'] = None
-
-    if st.session_state['representante_logado'] is None:
-        col_esq, col_centro, col_dir = st.columns([1, 2, 1])
-
-        with col_centro:
-            st.markdown('<div class="main-header">📊 Área do Representante</div>', unsafe_allow_html=True)
-            st.markdown('Acesse o sistema ou crie um cadastro.', unsafe_allow_html=True)
-
-            tab1, tab2 = st.tabs(["Login", "Novo Cadastro"])
-
-            with tab1:
-                st.subheader("Acesse o sistema")
-                login_user = st.text_input("Usuário", key="rep_user")
-                login_pass = st.text_input("Senha", type="password", key="rep_pass")
-                st.write("")
-
-                if st.button("ENTRAR", key="btn_rep_login"):
-                    if login_user and login_pass:
-                        usuario, msg = autenticar_representante(login_user, login_pass)
-                        if usuario is not None:
-                            st.session_state['representante_logado'] = usuario
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-                    else:
-                        st.warning("Preencha todos os campos")
-
-            with tab2:
-                st.subheader("Cadastro de Novo Representante")
-                st.warning("Para criar uma conta, você precisa do Token de Autorização da empresa.")
-
-                with st.form("form_novo_rep"):
-                    nome_rep = st.text_input("Seu Nome Completo")
-                    email_rep = st.text_input("Seu E-mail")
-                    user_rep = st.text_input("Crie um Usuário (Login)")
-                    pass_rep = st.text_input("Crie uma Senha", type="password")
-                    pass_rep_conf = st.text_input("Confirme a Senha", type="password")
-                    token_seguranca = st.text_input("Token de Admin", type="password", help="Peça ao gerente o código de cadastro")
-                    submit_novo_rep = st.form_submit_button("CADASTRAR")
-
-                    if submit_novo_rep:
-                        TOKEN_CORRETO = "ADMIN123"
-
-                        if token_seguranca != TOKEN_CORRETO:
-                            st.error("Token de Admin inválido! Cadastro não permitido.")
-                        elif not (nome_rep and user_rep and pass_rep):
-                            st.error("Preencha todos os campos obrigatórios.")
-                        elif pass_rep != pass_rep_conf:
-                            st.error("As senhas não coincidem.")
-                        else:
-                            sucesso, msg = salvar_usuario_representante(
-                                username=user_rep,
-                                nome=nome_rep,
-                                senha=pass_rep,
-                                email=email_rep
-                            )
-                            if sucesso:
-                                st.success("Conta criada com sucesso! Faça login na outra aba.")
-                            else:
-                                st.error(msg)
-
-        return
-
-    # Representante logado
-    rep = st.session_state['representante_logado']
-    username_rep = rep['username']
-
-    st.sidebar.title(f"Olá, {rep.get('nome', 'Representante')}! 👋")
-
-    menu = st.sidebar.radio(
-        "Menu",
-        ["Dashboard", "Importar Tabela de Preços", "Importar Clientes", "Gestão de Clientes", "Gerenciar Cotações"]
-    )
-
-    if st.sidebar.button("Sair"):
-        st.session_state['representante_logado'] = None
-        st.rerun()
-
-    # Footer com informações de contato
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("""
-    <small style='color: white; font-size: 10px; opacity: 0.7;'>
-    **Contato e Suporte:**<br>
-    📧 atendimento@beccai.com.br<br>
-    📞 (11) 95451.9325<br>
-    💻 Desenvolvido por www.beccai.com.br<br>
-    ---<br>
-    **Versão 1.0** | Janeiro 2026
-    </small>
-    """, unsafe_allow_html=True)
-
-    if menu == "Dashboard":
-        st.title("📊 Dashboard")
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            clientes = load_clientes(username_rep)
-            st.metric("Total de Clientes", len(clientes))
-
-        with col2:
-            cotacoes = load_cotacoes(username_rep)
-            st.metric("Total de Cotações", len(cotacoes))
-
-        with col3:
-            tabela = load_tabela_geral(username_rep)
-            st.metric("Produtos na Tabela", len(tabela))
-
-        st.markdown("---")
-
-        if not cotacoes.empty:
-            st.subheader("Cotações Recentes")
-            recentes = cotacoes.sort_values('data', ascending=False).head(5)
-            st.dataframe(recentes[['id', 'cliente_nome', 'data', 'status', 'total']], use_container_width=True)
-
-    elif menu == "Upload Tabela de Preços":
-        pagina_upload_tabela_precos(username_rep)
-
-    elif menu == "Upload Clientes":
-        pagina_upload_clientes(username_rep)
-
-    elif menu == "Gestão de Clientes":
-        pagina_gestao_clientes_representante(username_rep)
-
-    elif menu == "Gerenciar Cotações":
-        pagina_gerenciar_cotacoes_representante(username_rep)
-
-# ========================= 
-# APLICAÇÃO PRINCIPAL
-# ========================= 
 def main():
     st.set_page_config(
         page_title="RC Online",
-        page_icon="🎯",
+        page_icon="📊",
         layout="wide"
     )
-
-    init_auth_files()
-
-    st.sidebar.title("🎯RC Online")
+    
+    local_css()
+    
+    st.sidebar.title("RC Online")
     tipo_usuario = st.sidebar.radio("Tipo de Acesso", ["Cliente", "Representante"])
-
+    
     if tipo_usuario == "Cliente":
         pagina_cliente()
     else:
@@ -1584,3 +2047,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
