@@ -550,10 +550,10 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
 
 def upload_tabela_precos_csv(arquivo, representante_id):
     """
-    Lê CSV ou Excel de preços e faz upsert no banco (em lotes)
+    Lê CSV ou Excel, normaliza colunas inteligentes e SUBSTITUI a tabela antiga.
     """
     try:
-        # Detectar o tipo de arquivo pelo nome
+        # 1. Leitura do Arquivo (Igual ao anterior)
         nome_arquivo = arquivo.name.lower()
         arquivo.seek(0)
         
@@ -564,38 +564,78 @@ def upload_tabela_precos_csv(arquivo, representante_id):
             st.info("📄 Lendo arquivo CSV...")
             try:
                 df = pd.read_csv(arquivo, sep=',', encoding='utf-8', dtype=str)
-            except UnicodeDecodeError:
+            except:
                 arquivo.seek(0)
-                try:
-                    df = pd.read_csv(arquivo, sep=',', encoding='latin-1', dtype=str)
-                except:
-                    arquivo.seek(0)
-                    df = pd.read_csv(arquivo, sep=';', encoding='latin-1', dtype=str)
+                df = pd.read_csv(arquivo, sep=';', encoding='latin-1', dtype=str)
         else:
-            st.error("❌ Formato de arquivo não suportado. Use CSV ou Excel (.xlsx)")
+            st.error("❌ Formato não suportado.")
             return
         
         df = df.dropna(how='all')
-        # Limpar nomes das colunas
-        df.columns = [str(c).strip().replace(' ', '').replace('\n', '') for c in df.columns]
+
+        # ==========================================================
+        # 2. NORMALIZAÇÃO INTELIGENTE DE COLUNAS (O SEGREDO) 🧠
+        # ==========================================================
+        # Dicionário de "Alvos" vs "Possíveis Nomes" (Regex)
+        mapa_colunas = {
+            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item'], # Aceita: Codigo, Código, Codigo_1, SKU...
+            'Produto': [r'produto', r'descri[cç][aã]o', r'nome'],
+            'Unidade': [r'unidade', r'un'],
+            'Retira': [r'retira', r'balc[aã]o'],
+            'Entrega': [r'entrega', r'cif'],
+            # Preços por KM (procura por padrões numéricos)
+            'Preco100a199km': [r'100.*199'],
+            'Preco200a299km': [r'200.*299'],
+            'Preco300a399km': [r'300.*399'],
+            'PrecoAcima400km': [r'400', r'acima.*400'],
+            'PrecoAcima500km': [r'500', r'acima.*500'],
+            'PrecoAcima600km': [r'600', r'acima.*600']
+        }
+
+        # Função para achar a melhor coluna correspondente
+        colunas_originais = df.columns.tolist()
+        colunas_renomeadas = {}
+
+        for alvo, padroes in mapa_colunas.items():
+            for col in colunas_originais:
+                col_limpa = str(col).lower().strip()
+                # Testa cada padrão regex
+                for padrao in padroes:
+                    if re.search(padrao, col_limpa):
+                        colunas_renomeadas[col] = alvo
+                        break # Achou, para de procurar padrão para este alvo
+                if col in colunas_renomeadas:
+                    break # Achou coluna para este alvo, vai pro próximo alvo
         
-        # Validar colunas mínimas
-        if 'Codigo' not in df.columns and 'Código' not in df.columns:
-            st.error("❌ Coluna 'Codigo' não encontrada no arquivo")
-            return
-        if 'Produto' not in df.columns:
-            st.error("❌ Coluna 'Produto' não encontrada no arquivo")
-            return
+        # Renomeia as colunas no DataFrame
+        df = df.rename(columns=colunas_renomeadas)
         
-        if 'Código' in df.columns and 'Codigo' not in df.columns:
-            df['Codigo'] = df['Código']
-            
+        # Validação
+        if 'Codigo' not in df.columns or 'Produto' not in df.columns:
+            st.error(f"❌ Não consegui identificar as colunas 'Codigo' e 'Produto'.")
+            st.write("Colunas encontradas:", df.columns.tolist())
+            st.write("Colunas originais:", colunas_originais)
+            return
+
+        # Limpeza de IDs vazios
         df = df[(df['Codigo'].notna()) & (df['Codigo'] != '') & (df['Produto'].notna())]
-        
+
+        # ==========================================================
+        # 3. LIMPEZA DA TABELA ANTIGA (SUBSTITUIÇÃO) 🧹
+        # ==========================================================
+        st.warning("⚠️ Substituindo tabela antiga...")
+        try:
+            # Apaga TUDO deste representante antes de inserir
+            # Graças ao SQL que rodamos (ON DELETE SET NULL), isso não quebra o histórico
+            supabase.table('produtos').delete().eq('representante_id', representante_id).execute()
+        except Exception as e:
+            st.error(f"Erro ao limpar tabela antiga: {e}")
+            return
+
+        # ==========================================================
+        # 4. PREPARAÇÃO E UPLOAD (Lotes)
+        # ==========================================================
         produtos = []
-        erros = 0
-        
-        # --- NOVO: Captura a hora exata do upload para forçar atualização da data ---
         agora_iso = datetime.now(timezone.utc).isoformat()
         
         for idx, row in df.iterrows():
@@ -613,11 +653,34 @@ def upload_tabela_precos_csv(arquivo, representante_id):
                     'preco_acima400km': parse_preco(row.get('PrecoAcima400km')),
                     'preco_acima500km': parse_preco(row.get('PrecoAcima500km')),
                     'preco_acima600km': parse_preco(row.get('PrecoAcima600km')),
-                    # FORÇA A DATA DE ATUALIZAÇÃO:
                     'created_at': agora_iso 
                 })
+            except:
+                pass # Ignora linhas com erro
+         
+        # Upload em lotes
+        total_produtos = len(produtos)
+        batch_size = 500
+        produtos_salvos = 0
+        
+        progress_bar = st.progress(0)
+        
+        for i in range(0, total_produtos, batch_size):
+            batch = produtos[i:i + batch_size]
+            try:
+                # Como já limpamos, usamos insert simples (mais rápido que upsert)
+                supabase.table('produtos').insert(batch).execute()
+                produtos_salvos += len(batch)
+                progress_bar.progress(produtos_salvos / total_produtos)
             except Exception as e:
-                erros += 1
+                st.error(f"❌ Erro ao salvar lote: {e}")
+                break
+        
+        st.success(f"✅ Tabela substituída! {produtos_salvos} novos produtos cadastrados.")
+        st.balloons()
+
+    except Exception as e:
+        st.error(f"❌ Erro crítico: {e}")
          
         # ========================================
         # UPLOAD EM LOTES
@@ -2047,5 +2110,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
