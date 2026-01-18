@@ -1972,7 +1972,7 @@ def pagina_meus_pedidos(cliente):
                         link_whats = f"https://wa.me/55{tel_limpo}?text={texto_msg}"
                         
                         st.link_button(
-                            label="📲 Falar com Representante", 
+                            label="📲 Whatsapp do Representante", 
                             url=link_whats,
                             type="secondary", # Ou 'primary' se quiser destaque
                             help=f"Envia mensagem para {nome_rep} sobre este pedido"
@@ -2110,6 +2110,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
