@@ -572,83 +572,115 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
     
     return preco if preco and not pd.isna(preco) else None
 
+import re
+import pandas as pd
+from datetime import datetime, timezone
+
 def upload_tabela_precos_csv(arquivo, representante_id):
     """
-    Lê CSV ou Excel, normaliza colunas inteligentes e SUBSTITUI a tabela antiga.
+    Versão DEFINITIVA para ler qualquer variação de nome de coluna e formato de arquivo.
     """
     try:
-        # 1. Leitura do Arquivo
+        # 1. Leitura Robusta do Arquivo
         nome_arquivo = arquivo.name.lower()
         arquivo.seek(0)
-        
         df = None
         
-        if nome_arquivo.endswith('.xlsx') or nome_arquivo.endswith('.xls'):
-            df = pd.read_excel(arquivo, engine='openpyxl', dtype=str)
-        elif nome_arquivo.endswith('.csv'):
-            # Tenta ler com vírgula primeiro
+        # Leitura de EXCEL (.xlsx, .xls)
+        if nome_arquivo.endswith(('.xlsx', '.xls')):
             try:
-                df = pd.read_csv(arquivo, sep=',', encoding='utf-8', dtype=str)
-                # Se leu tudo em uma coluna só, provavelmente o separador está errado
-                if len(df.columns) <= 1:
-                    raise Exception("Separador errado")
-            except:
-                # Tenta com ponto e vírgula e encoding latin-1 (padrão Excel BR)
-                arquivo.seek(0)
-                df = pd.read_csv(arquivo, sep=';', encoding='latin-1', dtype=str)
+                df = pd.read_excel(arquivo, dtype=str)
+            except Exception as e:
+                st.error(f"Erro ao ler Excel: {e}")
+                return
+
+        # Leitura de CSV (.csv) com várias tentativas de codificação
+        elif nome_arquivo.endswith('.csv'):
+            encodings = ['utf-8-sig', 'latin-1', 'cp1252', 'utf-8']
+            separadores = [',', ';', '\t']
+            
+            # Tenta todas as combinações até conseguir ler
+            for enc in encodings:
+                for sep in separadores:
+                    try:
+                        arquivo.seek(0)
+                        temp_df = pd.read_csv(arquivo, sep=sep, encoding=enc, dtype=str, engine='python')
+                        
+                        # Se leu e tem mais de 1 coluna, consideramos sucesso
+                        if len(temp_df.columns) > 1:
+                            df = temp_df
+                            break
+                    except:
+                        continue
+                if df is not None:
+                    break
         
         if df is None:
-            st.error("❌ Formato não suportado ou erro na leitura.")
+            st.error("❌ Não consegui ler o arquivo. Tente salvar como 'CSV UTF-8' ou Excel (.xlsx).")
             return
 
         df = df.dropna(how='all')
 
         # ==========================================================
-        # 2. NORMALIZAÇÃO INTELIGENTE DE COLUNAS
+        # 2. MAPA DE COLUNAS FLEXÍVEL (REGEX)
         # ==========================================================
+        # A lógica aqui é: "Se tiver esse pedaço no nome, é essa coluna"
+        # O '.*' significa "qualquer coisa antes ou depois"
         mapa_colunas = {
-            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item'],
-            'Produto': [r'produto', r'descri[cç][aã]o', r'nome'],
-            'Unidade': [r'unidade', r'un'],
-            'Retira': [r'retira', r'balc[aã]o'],
-            'Entrega': [r'entrega', r'cif'],
-            # Regex ajustado para capturar os nomes da sua tabela
-            'Preco100a199km': [r'100.*199'],
-            'Preco200a299km': [r'200.*299'],
-            'Preco300a399km': [r'300.*399'],
+            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item', r'cod\.'], # Pega Código_19, Codigo, COD...
+            'Produto': [r'produto', r'descri[cç][aã]o', r'nome', r'material'], # Pega Descrição, Nome do Produto...
+            'Unidade': [r'unidade', r'un\.', r'^un$'], 
+            'Retira': [r'retira', r'balc[aã]o', r'loja'],
+            'Entrega': [r'entrega', r'cif', r'transp'],
+            
+            # Preços por KM (Procura por números chave no cabeçalho)
+            'Preco100a199km': [r'100.*199', r'100.*a.*199'],
+            'Preco200a299km': [r'200.*299', r'200.*a.*299'],
+            'Preco300a399km': [r'300.*399', r'300.*a.*399'],
             'PrecoAcima400km': [r'400', r'acima.*400'],
             'PrecoAcima500km': [r'500', r'acima.*500'],
             'PrecoAcima600km': [r'600', r'acima.*600']
         }
 
-        colunas_originais = df.columns.tolist()
+        colunas_originais = [str(c).strip() for c in df.columns.tolist()]
         colunas_renomeadas = {}
 
-        for alvo, padroes in mapa_colunas.items():
-            for col in colunas_originais:
-                col_limpa = str(col).lower().strip()
+        # Varredura inteligente
+        for col_real in colunas_originais:
+            col_lower = col_real.lower()
+            for coluna_alvo, padroes in mapa_colunas.items():
                 for padrao in padroes:
-                    if re.search(padrao, col_limpa):
-                        colunas_renomeadas[col] = alvo
-                        break 
-                if col in colunas_renomeadas:
-                    break 
-        
+                    # Se encontrar o padrão dentro do nome da coluna...
+                    if re.search(padrao, col_lower):
+                        colunas_renomeadas[col_real] = coluna_alvo
+                        break # Achou, para de testar padrões para este alvo
+                if col_real in colunas_renomeadas:
+                    break # Coluna já identificada, vai para a próxima
+
+        # Aplica os novos nomes
         df = df.rename(columns=colunas_renomeadas)
         
-        # Validação
+        # === DIAGNÓSTICO PARA O USUÁRIO ===
         if 'Codigo' not in df.columns or 'Produto' not in df.columns:
-            st.error(f"❌ Não consegui identificar as colunas 'Codigo' e 'Produto'. Verifique os nomes no arquivo.")
-            st.write("Colunas identificadas:", df.columns.tolist())
+            st.error("❌ Não consegui identificar as colunas principais.")
+            st.warning("Preciso de uma coluna que contenha **'Código'** (ou Ref/SKU) e outra com **'Produto'** (ou Descrição/Nome).")
+            
+            with st.expander("👀 Ver colunas que o sistema encontrou"):
+                st.write("Nomes originais no arquivo:")
+                st.write(colunas_originais)
+                st.write("---")
+                st.write("Como o sistema tentou renomear:")
+                st.write(colunas_renomeadas)
             return
 
+        # Filtra linhas vazias essenciais
         df = df[(df['Codigo'].notna()) & (df['Codigo'] != '') & (df['Produto'].notna())]
 
         # ==========================================================
-        # 3. LIMPEZA DA TABELA ANTIGA
+        # 3. LIMPEZA E UPLOAD
         # ==========================================================
         status_msg = st.empty()
-        status_msg.info("⏳ Processando dados...")
+        status_msg.info("⏳ Substituindo tabela de preços...")
         
         try:
             supabase.table('produtos').delete().eq('representante_id', representante_id).execute()
@@ -656,22 +688,29 @@ def upload_tabela_precos_csv(arquivo, representante_id):
             st.error(f"Erro ao limpar tabela antiga: {e}")
             return
 
-        # ==========================================================
-        # 4. PREPARAÇÃO E UPLOAD
-        # ==========================================================
         produtos = []
         agora_iso = datetime.now(timezone.utc).isoformat()
         erros_conversao = 0
         
+        # Barra de progresso visual
+        progresso_text = "Processando linhas..."
+        my_bar = st.progress(0, text=progresso_text)
+        total_linhas = len(df)
+
         for idx, row in df.iterrows():
-            # AQUI ESTAVA O ERRO: Usamos 'parse_money' agora, não 'parse_preco'
-            # E removemos o try/except global para ver se dá erro
             try:
+                # Atualiza barra a cada 50 linhas para não travar
+                if idx % 50 == 0:
+                    my_bar.progress(min(idx / total_linhas, 1.0), text=f"Processando item {idx}/{total_linhas}")
+
                 p = {
                     'representante_id': representante_id,
+                    # Converte para string e remove espaços extras
                     'codigo': str(row.get('Codigo', '')).strip(),
                     'produto': str(row.get('Produto', '')).strip(),
                     'unidade': str(row.get('Unidade', '')).strip() if pd.notna(row.get('Unidade')) else None,
+                    
+                    # Usa a função parse_money para limpar R$, virgulas, etc
                     'preco_retira': parse_money(row.get('Retira')),
                     'preco_entrega': parse_money(row.get('Entrega')), 
                     'preco_100a199km': parse_money(row.get('Preco100a199km')),
@@ -684,40 +723,32 @@ def upload_tabela_precos_csv(arquivo, representante_id):
                 }
                 produtos.append(p)
             except Exception as e:
-                # Agora se der erro numa linha, ele avisa no console do servidor, mas continua
-                print(f"Erro na linha {idx}: {e}")
+                print(f"Erro linha {idx}: {e}")
                 erros_conversao += 1
          
         if not produtos:
-            st.error("❌ Nenhum produto válido encontrado para salvar. Verifique se as colunas estão corretas.")
+            st.error("❌ Nenhum produto válido para salvar.")
             return
 
-        # Upload em lotes
-        total_produtos = len(produtos)
-        batch_size = 500
-        produtos_salvos = 0
-        
-        progress_bar = st.progress(0)
-        
-        for i in range(0, total_produtos, batch_size):
+        # Salva em Lotes de 1000 (mais rápido)
+        batch_size = 1000
+        for i in range(0, len(produtos), batch_size):
             batch = produtos[i:i + batch_size]
             try:
                 supabase.table('produtos').insert(batch).execute()
-                produtos_salvos += len(batch)
-                progress_bar.progress(min(produtos_salvos / total_produtos, 1.0))
             except Exception as e:
-                st.error(f"❌ Erro ao salvar lote no banco: {e}")
+                st.error(f"❌ Erro ao salvar no banco: {e}")
                 break
         
+        my_bar.empty()
         status_msg.empty()
-        st.success(f"✅ Sucesso! {produtos_salvos} produtos cadastrados.")
+        st.success(f"✅ Tabela atualizada! {len(produtos)} produtos cadastrados.")
         if erros_conversao > 0:
-            st.warning(f"⚠️ {erros_conversao} linhas foram ignoradas por erro de formatação.")
+            st.warning(f"⚠️ {erros_conversao} linhas ignoradas por erro de formatação.")
         st.balloons()
 
     except Exception as e:
-        st.error(f"❌ Erro crítico: {e}")
-
+        st.error(f"❌ Erro crítico no upload: {e}")
 # =====================================================================
 # FUNÇÕES DE DADOS - COTAÇÕES
 # =====================================================================
@@ -2120,6 +2151,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
