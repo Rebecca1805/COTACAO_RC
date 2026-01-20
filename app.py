@@ -1251,14 +1251,27 @@ def pagina_upload_tabela_precos(representante_id):
         with col1:
             st.metric("📦 Produtos", len(produtos))
         with col2:
-            preco_medio = produtos[['retira', 'entrega']].astype(float).mean().mean()
-            st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
+            # CORREÇÃO: Usando 'preco_retira' e 'preco_entrega' (nomes do banco)
+            cols_calc = ['preco_retira', 'preco_entrega']
+            # Garante que as colunas existem antes de calcular
+            cols_existentes = [c for c in cols_calc if c in produtos.columns]
+            
+            if cols_existentes:
+                preco_medio = produtos[cols_existentes].fillna(0).astype(float).mean().mean()
+                st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
+            else:
+                st.metric("💰 Preço Médio", "R$ 0,00")
+
         with col3:
-            st.metric("⚠️ Sem Preço", 
-                (produtos[['retira', 'entrega']].astype(float) == 0).sum().sum())
+            if cols_existentes:
+                qtd_sem_preco = (produtos[cols_existentes].fillna(0).astype(float) == 0).sum().sum()
+                st.metric("⚠️ Sem Preço", qtd_sem_preco)
+            else:
+                st.metric("⚠️ Sem Preço", 0)
         
         with st.expander("👁️ Visualizar tabela atual", expanded=False):
-            cols_view = ['codigo', 'produto', 'unidade', 'retira', 'entrega']
+            # CORREÇÃO: Ajustando nomes para visualização também
+            cols_view = ['codigo', 'produto', 'unidade', 'preco_retira', 'preco_entrega']
             cols_disponiveis = [c for c in cols_view if c in produtos.columns]
             st.dataframe(produtos[cols_disponiveis].head(50), use_container_width=True)
         
@@ -2326,6 +2339,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
