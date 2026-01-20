@@ -1307,7 +1307,7 @@ def pagina_upload_tabela_precos(representante_id):
                 st.write("✅ Arquivo processado com sucesso e pronto para sincronizar!")
             
             with col2:
-                if st.button("🚀 Sincronizar com Supabase", type="primary", key="btn_sincronizar"):
+                if st.button("🚀 Atualizar Dados", type="primary", key="btn_sincronizar"):
                     with st.spinner("⏳ Sincronizando produtos..."):
                         sucesso, mensagem = sincronizar_produtos_supabase(
                             supabase_client=supabase,
@@ -2326,6 +2326,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
