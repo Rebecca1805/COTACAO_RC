@@ -1,4 +1,4 @@
-import os
+mport os
 from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
@@ -31,6 +31,30 @@ def data_brasil(data_iso):
         dt = dt - pd.Timedelta(hours=3)
         
     return dt
+def parse_money(valor):
+    """
+    Converte string de dinheiro BR (ex: '1.234,56') para float (1234.56).
+    Aceita também float/int direto.
+    """
+    if valor is None or pd.isna(valor) or valor == "":
+        return 0.0
+    
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    
+    # Converte para string e limpa
+    texto = str(valor).strip()
+    
+    # Remove R$, espaços e pontos de milhar (ex: 1.000 -> 1000)
+    texto = texto.replace("R$", "").replace(" ", "").replace(".", "")
+    
+    # Substitui vírgula decimal por ponto (ex: 50,00 -> 50.00)
+    texto = texto.replace(",", ".")
+    
+    try:
+        return float(texto)
+    except ValueError:
+        return 0.0
 
 # =====================================================================
 # CONFIGURAÇÃO DO SUPABASE
@@ -553,37 +577,42 @@ def upload_tabela_precos_csv(arquivo, representante_id):
     Lê CSV ou Excel, normaliza colunas inteligentes e SUBSTITUI a tabela antiga.
     """
     try:
-        # 1. Leitura do Arquivo (Igual ao anterior)
+        # 1. Leitura do Arquivo
         nome_arquivo = arquivo.name.lower()
         arquivo.seek(0)
         
+        df = None
+        
         if nome_arquivo.endswith('.xlsx') or nome_arquivo.endswith('.xls'):
-            st.info("📊 Lendo arquivo Excel...")
             df = pd.read_excel(arquivo, engine='openpyxl', dtype=str)
         elif nome_arquivo.endswith('.csv'):
-            st.info("📄 Lendo arquivo CSV...")
+            # Tenta ler com vírgula primeiro
             try:
                 df = pd.read_csv(arquivo, sep=',', encoding='utf-8', dtype=str)
+                # Se leu tudo em uma coluna só, provavelmente o separador está errado
+                if len(df.columns) <= 1:
+                    raise Exception("Separador errado")
             except:
+                # Tenta com ponto e vírgula e encoding latin-1 (padrão Excel BR)
                 arquivo.seek(0)
                 df = pd.read_csv(arquivo, sep=';', encoding='latin-1', dtype=str)
-        else:
-            st.error("❌ Formato não suportado.")
-            return
         
+        if df is None:
+            st.error("❌ Formato não suportado ou erro na leitura.")
+            return
+
         df = df.dropna(how='all')
 
         # ==========================================================
-        # 2. NORMALIZAÇÃO INTELIGENTE DE COLUNAS (O SEGREDO) 🧠
+        # 2. NORMALIZAÇÃO INTELIGENTE DE COLUNAS
         # ==========================================================
-        # Dicionário de "Alvos" vs "Possíveis Nomes" (Regex)
         mapa_colunas = {
-            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item'], # Aceita: Codigo, Código, Codigo_1, SKU...
+            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item'],
             'Produto': [r'produto', r'descri[cç][aã]o', r'nome'],
             'Unidade': [r'unidade', r'un'],
             'Retira': [r'retira', r'balc[aã]o'],
             'Entrega': [r'entrega', r'cif'],
-            # Preços por KM (procura por padrões numéricos)
+            # Regex ajustado para capturar os nomes da sua tabela
             'Preco100a199km': [r'100.*199'],
             'Preco200a299km': [r'200.*299'],
             'Preco300a399km': [r'300.*399'],
@@ -592,72 +621,77 @@ def upload_tabela_precos_csv(arquivo, representante_id):
             'PrecoAcima600km': [r'600', r'acima.*600']
         }
 
-        # Função para achar a melhor coluna correspondente
         colunas_originais = df.columns.tolist()
         colunas_renomeadas = {}
 
         for alvo, padroes in mapa_colunas.items():
             for col in colunas_originais:
                 col_limpa = str(col).lower().strip()
-                # Testa cada padrão regex
                 for padrao in padroes:
                     if re.search(padrao, col_limpa):
                         colunas_renomeadas[col] = alvo
-                        break # Achou, para de procurar padrão para este alvo
+                        break 
                 if col in colunas_renomeadas:
-                    break # Achou coluna para este alvo, vai pro próximo alvo
+                    break 
         
-        # Renomeia as colunas no DataFrame
         df = df.rename(columns=colunas_renomeadas)
         
         # Validação
         if 'Codigo' not in df.columns or 'Produto' not in df.columns:
-            st.error(f"❌ Não consegui identificar as colunas 'Codigo' e 'Produto'.")
-            st.write("Colunas encontradas:", df.columns.tolist())
-            st.write("Colunas originais:", colunas_originais)
+            st.error(f"❌ Não consegui identificar as colunas 'Codigo' e 'Produto'. Verifique os nomes no arquivo.")
+            st.write("Colunas identificadas:", df.columns.tolist())
             return
 
-        # Limpeza de IDs vazios
         df = df[(df['Codigo'].notna()) & (df['Codigo'] != '') & (df['Produto'].notna())]
 
         # ==========================================================
-        # 3. LIMPEZA DA TABELA ANTIGA (SUBSTITUIÇÃO) 🧹
+        # 3. LIMPEZA DA TABELA ANTIGA
         # ==========================================================
-        st.warning("⚠️ Substituindo tabela antiga...")
+        status_msg = st.empty()
+        status_msg.info("⏳ Processando dados...")
+        
         try:
-            # Apaga TUDO deste representante antes de inserir
-            # Graças ao SQL que rodamos (ON DELETE SET NULL), isso não quebra o histórico
             supabase.table('produtos').delete().eq('representante_id', representante_id).execute()
         except Exception as e:
             st.error(f"Erro ao limpar tabela antiga: {e}")
             return
 
         # ==========================================================
-        # 4. PREPARAÇÃO E UPLOAD (Lotes)
+        # 4. PREPARAÇÃO E UPLOAD
         # ==========================================================
         produtos = []
         agora_iso = datetime.now(timezone.utc).isoformat()
+        erros_conversao = 0
         
         for idx, row in df.iterrows():
+            # AQUI ESTAVA O ERRO: Usamos 'parse_money' agora, não 'parse_preco'
+            # E removemos o try/except global para ver se dá erro
             try:
-                produtos.append({
+                p = {
                     'representante_id': representante_id,
                     'codigo': str(row.get('Codigo', '')).strip(),
                     'produto': str(row.get('Produto', '')).strip(),
                     'unidade': str(row.get('Unidade', '')).strip() if pd.notna(row.get('Unidade')) else None,
-                    'preco_retira': parse_preco(row.get('Retira')),
-                    'preco_entrega': parse_preco(row.get('Entrega')), 
-                    'preco_100a199km': parse_preco(row.get('Preco100a199km')),
-                    'preco_200a299km': parse_preco(row.get('Preco200a299km')),
-                    'preco_300a399km': parse_preco(row.get('Preco300a399km')),
-                    'preco_acima400km': parse_preco(row.get('PrecoAcima400km')),
-                    'preco_acima500km': parse_preco(row.get('PrecoAcima500km')),
-                    'preco_acima600km': parse_preco(row.get('PrecoAcima600km')),
+                    'preco_retira': parse_money(row.get('Retira')),
+                    'preco_entrega': parse_money(row.get('Entrega')), 
+                    'preco_100a199km': parse_money(row.get('Preco100a199km')),
+                    'preco_200a299km': parse_money(row.get('Preco200a299km')),
+                    'preco_300a399km': parse_money(row.get('Preco300a399km')),
+                    'preco_acima400km': parse_money(row.get('PrecoAcima400km')),
+                    'preco_acima500km': parse_money(row.get('PrecoAcima500km')),
+                    'preco_acima600km': parse_money(row.get('PrecoAcima600km')),
                     'created_at': agora_iso 
-                })
-            except:
-                pass # Ignora linhas com erro
+                }
+                produtos.append(p)
+            except Exception as e:
+                # Agora se der erro numa linha, ele avisa no console do servidor, mas continua
+                print(f"Erro na linha {idx}: {e}")
+                erros_conversao += 1
          
+        if not produtos:
+            st.error("❌ Nenhum produto válido encontrado para salvar. Verifique se as colunas estão corretas.")
+            return
+
         # Upload em lotes
         total_produtos = len(produtos)
         batch_size = 500
@@ -668,42 +702,18 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         for i in range(0, total_produtos, batch_size):
             batch = produtos[i:i + batch_size]
             try:
-                # Como já limpamos, usamos insert simples (mais rápido que upsert)
                 supabase.table('produtos').insert(batch).execute()
                 produtos_salvos += len(batch)
-                progress_bar.progress(produtos_salvos / total_produtos)
+                progress_bar.progress(min(produtos_salvos / total_produtos, 1.0))
             except Exception as e:
-                st.error(f"❌ Erro ao salvar lote: {e}")
+                st.error(f"❌ Erro ao salvar lote no banco: {e}")
                 break
         
-        st.success(f"✅ Tabela substituída! {produtos_salvos} novos produtos cadastrados.")
+        status_msg.empty()
+        st.success(f"✅ Sucesso! {produtos_salvos} produtos cadastrados.")
+        if erros_conversao > 0:
+            st.warning(f"⚠️ {erros_conversao} linhas foram ignoradas por erro de formatação.")
         st.balloons()
-
-    except Exception as e:
-        st.error(f"❌ Erro crítico: {e}")
-         
-        # ========================================
-        # UPLOAD EM LOTES
-        # ========================================
-        total_produtos = len(produtos)
-        batch_size = 500
-        total_batches = (total_produtos + batch_size - 1) // batch_size
-        
-        st.info(f"💾 Salvando {total_produtos} produtos em {total_batches} lotes...")
-        progress_bar = st.progress(0)
-        produtos_salvos = 0
-        
-        for i in range(0, total_produtos, batch_size):
-            batch = produtos[i:i + batch_size]
-            try:
-                supabase.table('produtos').upsert(batch, on_conflict='representante_id,codigo').execute()
-                produtos_salvos += len(batch)
-                progress_bar.progress(produtos_salvos / total_produtos)
-            except Exception as e:
-                st.error(f"❌ Erro ao salvar lote: {e}")
-                break
-        
-        st.success(f"✅ {produtos_salvos} produtos importados/atualizados!")
 
     except Exception as e:
         st.error(f"❌ Erro crítico: {e}")
@@ -2110,6 +2120,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
