@@ -1,7 +1,35 @@
-.env
+# Python
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Streamlit
 .streamlit/secrets.toml
+.streamlit/config.toml
+
+# Logs e temporários
+*.log
+output.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ambiente local
+.env
+.env.local
 venv/
 env/
+
+# Sistema
+.DS_Store
+Thumbs.db
