@@ -28,6 +28,7 @@ MAPA_COLUNAS = {
     'product_code': 'codigo',
     'productcode': 'codigo',
     
+    
     # Produto/Nome
     'produto_1': 'produto',
     'nome': 'produto',
@@ -46,31 +47,70 @@ MAPA_COLUNAS = {
     'un': 'unidade',
     'measurement': 'unidade',
     
-    # Preços (variações comuns)
-    'preco_retira_1': 'retira',
-    'preco_retirada': 'retira',
-    'precoretirada': 'retira',
-    'price_pickup': 'retira',
-    'pickup_price': 'retira',
-    'retirada': 'retira',
-    'varejo': 'retira',
-    'preco_varejo': 'retira',
-    'preco_unitario_retira': 'retira',
-    'precounitarioretira': 'retira',
-    'preco_retira': 'retira',
+    # Preços - Retirada
+    'preco_retira_1': 'preco_retira',
+    'preco_retirada': 'preco_retira',
+    'precoretirada': 'preco_retira',
+    'price_pickup': 'preco_retira',
+    'pickup_price': 'preco_retira',
+    'retirada': 'preco_retira',
+    'varejo': 'preco_retira',
+    'preco_varejo': 'preco_retira',
+    'preco_unitario_retira': 'preco_retira',
+    'precounitarioretira': 'preco_retira',
+    'retira': 'preco_retira',
+    'balcao': 'preco_retira',
+    'loja': 'preco_retira',
     
-    'preco_entrega_1': 'entrega',
-    'preco_entrega': 'entrega',
-    'precoentrega': 'entrega',
-    'preco_delivery': 'entrega',
-    'precodelivery': 'entrega',
-    'price_delivery': 'entrega',
-    'delivery_price': 'entrega',
-    'atacado': 'entrega',
-    'preco_atacado': 'entrega',
-    'preco_unitario_entrega': 'entrega',
-    'precounitarioentrega': 'entrega',
-    'preco_unitario_delivery': 'entrega',
+    # Preços - Entrega Geral (fallback para preco_entrega)
+    'preco_entrega_1': 'preco_entrega',
+    'preco_entrega': 'preco_entrega',
+    'precoentrega': 'preco_entrega',
+    'preco_delivery': 'preco_entrega',
+    'precodelivery': 'preco_entrega',
+    'price_delivery': 'preco_entrega',
+    'delivery_price': 'preco_entrega',
+    'atacado': 'preco_entrega',
+    'preco_atacado': 'preco_entrega',
+    'entrega': 'preco_entrega', 
+    'frete': 'preco_entrega',
+    'transporte': 'preco_entrega',
+    
+    # Preços por Distância (100-199km)
+    'preco_100a199km': 'preco_100a199km',
+    'preco100a199km': 'preco_100a199km',
+    'preco_100_199': 'preco_100a199km',
+    'price_100_199': 'preco_100a199km',
+    
+    # Preços por Distância (200-299km)
+    'preco_200a299km': 'preco_200a299km',
+    'preco200a299km': 'preco_200a299km',
+    'preco_200_299': 'preco_200a299km',
+    'price_200_299': 'preco_200a299km',
+    
+    # Preços por Distância (300-399km)
+    'preco_300a399km': 'preco_300a399km',
+    'preco300a399km': 'preco_300a399km',
+    'preco_300_399': 'preco_300a399km',
+    'price_300_399': 'preco_300a399km',
+    
+    # Preços por Distância (acima 400km)
+    'preco_acima400km': 'preco_acima400km',
+    'precoac400km': 'preco_acima400km',
+    'preco_400': 'preco_acima400km',
+    'price_400': 'preco_acima400km',
+    
+    # Preços por Distância (acima 500km)
+    'preco_acima500km': 'preco_acima500km',
+    'precoac500km': 'preco_acima500km',
+    'preco_500': 'preco_acima500km',
+    'price_500': 'preco_acima500km',
+    
+    # Preços por Distância (acima 600km)
+    'preco_acima600km': 'preco_acima600km',
+    'precoac600km': 'preco_acima600km',
+    'preco_600': 'preco_acima600km',
+    'price_600': 'preco_acima600km',
     
     # Variações de preço geral (fallback)
     'preco': 'preco_padrao',
@@ -371,7 +411,7 @@ def sincronizar_produtos_supabase(
     """
     Sincroniza produtos com Supabase:
     1. (Opcional) Limpa tabela antiga
-    2. Insere novos produtos
+    2. Insere novos produtos com múltiplos preços por distância
     3. Retorna (sucesso: bool, mensagem: str)
     """
     try:
@@ -395,25 +435,50 @@ def sincronizar_produtos_supabase(
         
         # 2. Preparar dados para inserção
         records = []
+        colunas_preco_distancia = [
+            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
+            'preco_acima400km', 'preco_acima500km', 'preco_acima600km'
+        ]
+
+        # --- PROTEÇÃO: LISTA DE COLUNAS PERMITIDAS NO BANCO ---
+        # Isso evita o erro PGRST204 se o Excel tiver colunas extras
+        colunas_permitidas = [
+            'representante_id', 'codigo', 'produto', 'unidade',
+            'preco_retira', 'preco_entrega', 
+            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
+            'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
+            'created_at', 'updated_at'
+        ]
+        
         for idx, row in df.iterrows():
             record = {
                 'codigo': str(row.get('codigo', '')).strip(),
                 'produto': str(row.get('produto', '')).strip(),
                 'unidade': str(row.get('unidade', 'UN')).strip() or 'UN',
-                'retira': float(row.get('retira', 0)) or 0.0,
-                'entrega': float(row.get('entrega', 0)) or 0.0,
+                'preco_retira': float(row.get('preco_retira', 0)) or 0.0,
+                'preco_entrega': float(row.get('preco_entrega', 0)) or 0.0,
                 'updated_at': row.get('updated_at', pd.Timestamp.now().isoformat()),
             }
+            
+            # Adiciona preços por distância se existirem
+            for col_dist in colunas_preco_distancia:
+                if col_dist in df.columns:
+                    valor = row.get(col_dist, 0)
+                    record[col_dist] = float(valor) if pd.notna(valor) else 0.0
             
             # Adiciona representante se fornecido
             if representante_id:
                 record['representante_id'] = representante_id
             
-            # Adiciona outras colunas que estejam no DataFrame
+            # Adiciona outras colunas APENAS SE existirem no banco
             for col in df.columns:
-                if col not in record and col not in ['index', 'Unnamed']:
+                if col not in record and col in colunas_permitidas:
                     try:
-                        record[col] = row[col]
+                        val = row[col]
+                        # Converte NaN para None (null no SQL)
+                        if pd.isna(val):
+                            val = None
+                        record[col] = val
                     except:
                         pass
             
@@ -429,8 +494,11 @@ def sincronizar_produtos_supabase(
                 resultado = supabase_client.table(tabela).insert(lote).execute()
                 total_inseridos += len(lote)
             except Exception as e:
-                st.error(f"❌ Erro ao inserir lote {i//tamanho_lote + 1}: {e}")
-                return False, f"Falha ao inserir produtos"
+                # Mostra o erro exato mas não trava tudo imediatamente, tenta mostrar log
+                erro_msg = str(e)
+                st.error(f"❌ Erro ao inserir lote {i//tamanho_lote + 1}: {erro_msg}")
+                print(f"DEBUG ERRO LOTE: {lote[0] if lote else 'Vazio'}") # Ajuda a debugar
+                return False, f"Falha ao inserir produtos: {erro_msg}"
         
         mensagem = f"✅ {total_inseridos} produtos sincronizados com sucesso!"
         return True, mensagem
@@ -466,3 +534,4 @@ def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
     
     st.write("**Primeiras linhas:**")
     st.dataframe(df.head(max_linhas), use_container_width=True)
+
