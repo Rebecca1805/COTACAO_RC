@@ -7,7 +7,16 @@ from fpdf import FPDF
 import bcrypt
 from supabase import create_client, Client
 
-# Adicione isso logo após os imports
+# Importa o módulo de gerenciamento de produtos
+from produtos_manager import (
+    processar_arquivo_produtos,
+    sincronizar_produtos_supabase,
+    exibir_preview_dados,
+    ler_arquivo,
+    normalizar_colunas,
+    validar_dados,
+    limpar_dados
+)
 def data_brasil(data_iso):
     """Converte string ISO ou datetime UTC para string formatada BR (-3h)"""
     if not data_iso:
@@ -55,6 +64,80 @@ def parse_money(valor):
         return float(texto)
     except ValueError:
         return 0.0
+    
+def processar_tabela_produtos(arquivo):
+    """
+    Lê arquivos CSV ou Excel, padroniza as colunas e converte preços.
+    Retorna um DataFrame pronto para o Supabase ou exibe erro no st.
+    """
+    try:
+        # 1. Identificar extensão e ler o arquivo
+        nome_arquivo = arquivo.name.lower()
+        
+        if nome_arquivo.endswith('.csv'):
+            # Tenta ler com diferentes encodings e separadores comuns no Brasil
+            try:
+                df = pd.read_csv(arquivo, sep=',', decimal=',', quotechar='"', encoding='utf-8')
+            except:
+                try:
+                    arquivo.seek(0)
+                    df = pd.read_csv(arquivo, sep=';', decimal=',', encoding='latin1')
+                except Exception as e:
+                    st.error(f"Erro ao ler CSV. Verifique se o separador é vírgula ou ponto-e-vírgula. Detalhe: {e}")
+                    return None
+        elif nome_arquivo.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(arquivo)
+        else:
+            st.error("Formato de arquivo não suportado. Use CSV ou Excel.")
+            return None
+
+        # 2. Padronização dos Nomes das Colunas (Mapa de Correção)
+        # Transforma tudo para minúsculo e remove espaços para comparar
+        df.columns = [c.strip().lower() for c in df.columns]
+        
+        mapa_colunas = {
+            'codigo_1': 'codigo',
+            'produto_1': 'produto',
+            'unidade_1': 'unidade',
+            'entrega_1': 'entrega',
+            # Adicione aqui outras variações se aparecerem
+        }
+        
+        # Renomeia as colunas erradas para o padrão certo
+        df = df.rename(columns=mapa_colunas)
+
+        # 3. Validação das Colunas Obrigatórias
+        colunas_esperadas = ['codigo', 'produto', 'retira', 'entrega']
+        if not all(col in df.columns for col in colunas_esperadas):
+            st.error(f"O arquivo não possui as colunas obrigatórias: {colunas_esperadas}. Colunas encontradas: {list(df.columns)}")
+            return None
+
+        # 4. Tratamento de Preços (Limpeza Robusta)
+        colunas_preco = [c for c in df.columns if 'preco' in c or c in ['retira', 'entrega']]
+        
+        for col in colunas_preco:
+            # Função lambda para limpar e converter cada valor
+            def limpar_preco(x):
+                if pd.isna(x): return 0.0
+                if isinstance(x, (int, float)): return float(x)
+                
+                # Trata string: remove "R$", espaços, pontos de milhar e troca vírgula por ponto
+                s = str(x).strip().replace('R$', '').replace(' ', '')
+                if ',' in s:
+                    s = s.replace('.', '').replace(',', '.') # Ex: 1.000,50 -> 1000.50
+                
+                try:
+                    return float(s)
+                except:
+                    return 0.0
+
+            df[col] = df[col].apply(limpar_preco)
+
+        return df
+
+    except Exception as e:
+        st.error(f"Erro crítico ao processar tabela: {str(e)}")
+        return None    
 
 # =====================================================================
 # CONFIGURAÇÃO DO SUPABASE
@@ -1127,49 +1210,104 @@ def pagina_dashboard(representante_id):
         st.dataframe(df_final, width='stretch', hide_index=True)
 
 def pagina_upload_tabela_precos(representante_id):
-    """Página para upload da tabela de preços"""
+    """Página para upload da tabela de preços com validação robusta"""
     st.subheader("📤 Gerenciar Tabela de Preços")
     
+    # ========== STATUS ATUAL ==========
     produtos = carregar_produtos(representante_id)
     
     if not produtos.empty:
         if 'created_at' in produtos.columns:
-            # Pega a maior data
             ultima_atualizacao = pd.to_datetime(produtos['created_at']).max()
-            
-            # --- CORREÇÃO DE FUSO: Remover timezone e subtrair 3h ---
             if ultima_atualizacao.tzinfo:
                 ultima_atualizacao = ultima_atualizacao.tz_localize(None)
             ultima_atualizacao = ultima_atualizacao - pd.Timedelta(hours=3)
-            
             data_fmt = ultima_atualizacao.strftime('%d/%m/%Y às %H:%M')
             st.success(f"✅ Tabela Ativa (Última atualização: **{data_fmt}**)")
         else:
             st.success("✅ Tabela Ativa")
-            
-        st.info(f"Total de produtos cadastrados: {len(produtos)}")
         
-        with st.expander("👁️ Visualizar tabela atual"):
-            st.dataframe(produtos[['codigo', 'produto', 'unidade', 'preco_retira']].head(50))
-        st.warning("⚠️ Carregar uma nova tabela substituirá/atualizará os produtos existentes.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📦 Produtos", len(produtos))
+        with col2:
+            preco_medio = produtos[['retira', 'entrega']].astype(float).mean().mean()
+            st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
+        with col3:
+            st.metric("⚠️ Sem Preço", 
+                (produtos[['retira', 'entrega']].astype(float) == 0).sum().sum())
+        
+        with st.expander("👁️ Visualizar tabela atual", expanded=False):
+            cols_view = ['codigo', 'produto', 'unidade', 'retira', 'entrega']
+            cols_disponiveis = [c for c in cols_view if c in produtos.columns]
+            st.dataframe(produtos[cols_disponiveis].head(50), use_container_width=True)
+        
+        st.warning("⚠️ Carregar uma nova tabela substituirá completamente os produtos existentes.")
     else:
-        st.error("📋 Nenhuma tabela de preços cadastrada ainda.")
+        st.info("📋 Nenhuma tabela de preços cadastrada ainda.")
     
-    # ... (O restante da função de upload continua IGUAL ao anterior) ...
+    # ========== UPLOAD DE NOVO ARQUIVO ==========
     st.markdown("---")
-    st.markdown("### 📥 Carregar Nova Tabela")
-    # (Copie o resto do código de upload igual estava, não mudou lógica aqui)
-    # Para facilitar, vou deixar o bloco do upload resumido, você mantém o que já tinha:
+    st.markdown("### 📥 Carregar Nova Tabela de Preços")
+    
     st.markdown("""
-    **Formato esperado:** CSV ou Excel (.xlsx) com `Codigo` e `Produto`.
+    **Formatos suportados:** CSV (.csv), Excel (.xlsx, .xls)
+    
+    **Colunas obrigatórias:**
+    - `Código` (ou `codigo`, `Code`, `SKU`)
+    - `Produto` (ou `Nome`, `Descrição`)
+    
+    **Colunas recomendadas:**
+    - `Unidade` (UN, KG, etc)
+    - `Retira` ou `Preço Retirada` (preço sem frete)
+    - `Entrega` ou `Preço Entrega` (preço com frete)
+    
+    **Nota:** O sistema aceita variações de nomes de colunas e formata automaticamente.
     """)
-    arquivo_upload = st.file_uploader("Selecione o arquivo", type=['csv', 'xlsx', 'xls'])
+    
+    arquivo_upload = st.file_uploader(
+        "Selecione o arquivo",
+        type=['csv', 'xlsx', 'xls'],
+        help="CSV ou Excel com dados de produtos e preços"
+    )
     
     if arquivo_upload is not None:
-        if st.button("✅ Confirmar e Atualizar Tabela", type="primary", key="btn_confirmar_tabela"):
-             upload_tabela_precos_csv(arquivo_upload, representante_id)
-             st.balloons()
-             st.rerun()
+        # ========== PROCESSAR E VALIDAR ==========
+        df_processado = processar_arquivo_produtos(arquivo_upload)
+        
+        if df_processado is not None:
+            # ========== PREVIEW ==========
+            exibir_preview_dados(df_processado)
+            
+            # ========== CONFIRMAÇÃO ==========
+            st.markdown("---")
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.write("✅ Arquivo processado com sucesso e pronto para sincronizar!")
+            
+            with col2:
+                if st.button("🚀 Sincronizar com Supabase", type="primary", key="btn_sincronizar"):
+                    with st.spinner("⏳ Sincronizando produtos..."):
+                        sucesso, mensagem = sincronizar_produtos_supabase(
+                            supabase_client=supabase,
+                            df=df_processado,
+                            tabela='produtos',
+                            limpar_antes=True,
+                            representante_id=representante_id
+                        )
+                    
+                    if sucesso:
+                        st.success(mensagem)
+                        st.balloons()
+                        st.session_state['recarregar_pagina'] = True
+                        import time
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(mensagem)
+                        st.info("Verifique se a tabela 'produtos' existe no Supabase com as colunas corretas.")
+                        st.info("Colunas esperadas: codigo, produto, unidade, retira, entrega, representante_id, updated_at")
 
 def pagina_upload_clientes(representante_id):
     """Página para upload de clientes"""
@@ -2162,6 +2300,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 
