@@ -572,10 +572,6 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
     
     return preco if preco and not pd.isna(preco) else None
 
-import re
-import pandas as pd
-from datetime import datetime, timezone
-
 def upload_tabela_precos_csv(arquivo, representante_id):
     """
     Versão DEFINITIVA para ler qualquer variação de nome de coluna e formato de arquivo.
@@ -2151,6 +2147,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
