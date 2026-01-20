@@ -645,7 +645,7 @@ def buscar_produtos(representante_id, termo):
 def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
     """
     Retorna o preço do produto baseado na coluna de preço do cliente
-    e forma de recebimento (retirada ou entrega)
+    e forma de recebimento (retirada ou entrega com múltiplas distâncias)
     """
     if forma_recebimento == 'Retirada no centro de distribuição':
         preco = produto_row.get('preco_retira')
@@ -654,6 +654,26 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
         preco = produto_row.get(coluna_preco)
     
     return preco if preco and not pd.isna(preco) else None
+
+def obter_opcoes_distancia():
+    """
+    Retorna as opções de distância disponíveis no sistema.
+    Ordem: retirada, entrega (até 100km), depois distâncias crescentes.
+    """
+    return [
+        ("Retirada no centro de distribuição", "preco_retira"),
+        ("Entrega (até 100 km)", "preco_entrega"),
+        ("100 a 199 km", "preco_100a199km"),
+        ("200 a 299 km", "preco_200a299km"),
+        ("300 a 399 km", "preco_300a399km"),
+        ("Acima de 400 km", "preco_acima400km"),
+        ("Acima de 500 km", "preco_acima500km"),
+        ("Acima de 600 km", "preco_acima600km"),
+    ]
+
+def formatar_opcao_distancia(opcao_label):
+    """Formata o label da opção de distância para exibição"""
+    return f"📍 {opcao_label}"
 
 def upload_tabela_precos_csv(arquivo, representante_id):
     """
@@ -1833,15 +1853,21 @@ def pagina_nova_cotacao(cliente):
         st.success(st.session_state["msg_sucesso"])
         del st.session_state["msg_sucesso"] # Remove para não aparecer de novo
 
-    # Forma de recebimento
-    forma_recebimento = st.radio(
-        "Como deseja receber os produtos?",
-        ["Retirada no centro de distribuição", "Entrega no endereço"],
+    # Forma de recebimento com opções de distância
+    opcoes_distancia = obter_opcoes_distancia()
+    labels_distancia = [label for label, _ in opcoes_distancia]
+    
+    idx_selecionado = st.radio(
+        "Como deseia receber os produtos? (Selecione a distância)",
+        range(len(labels_distancia)),
+        format_func=lambda i: formatar_opcao_distancia(labels_distancia[i]),
         key="forma_recebimento_cotacao"
     )
     
+    forma_recebimento_label, coluna_preco = opcoes_distancia[idx_selecionado]
+    forma_recebimento = forma_recebimento_label  # Para compatibilidade com código anterior
+    
     pode_ver_preco = bool(cliente.get('visualiza_preco', True))
-    coluna_preco = cliente.get('coluna_preco', 'preco_100a199km')
     
     st.markdown("---")
     st.subheader("🔍 Buscar e adicionar produtos")
@@ -2300,6 +2326,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
