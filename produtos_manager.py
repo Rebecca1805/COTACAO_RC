@@ -534,4 +534,3 @@ def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
     
     st.write("**Primeiras linhas:**")
     st.dataframe(df.head(max_linhas), use_container_width=True)
-
