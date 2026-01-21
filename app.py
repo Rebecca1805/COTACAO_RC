@@ -1813,34 +1813,48 @@ def pagina_nova_cotacao(cliente):
         st.success(st.session_state["msg_sucesso"])
         del st.session_state["msg_sucesso"] # Remove para não aparecer de novo
 
-    # Forma de recebimento - cliente escolhe apenas Retirada ou Entrega
-    # A coluna de preço é automaticamente definida pela distância cadastrada
-    # --- CORREÇÃO AQUI ---
-    # 1. Busca o nome da coluna correta usando a chave com underscore (como está no banco)
+    # ============================================================
+    # 1. VERIFICAÇÃO DE CARRINHO (Movido para cima para a trava funcionar)
+    # ============================================================
+    if 'itens_cotacao' not in st.session_state:
+        st.session_state.itens_cotacao = []
+    
+    # Verifica se já existem itens na lista
+    tem_itens_no_carrinho = len(st.session_state.itens_cotacao) > 0
+
+    # ============================================================
+    # 2. DEFINIÇÃO DA COLUNA DE PREÇO DO CLIENTE
+    # ============================================================
+    # Busca o nome da coluna correta usando a chave com underscore
     coluna_preco_cliente = cliente.get("coluna_preco")
     
     # Se por acaso estiver vazio, definimos o padrão
     if not coluna_preco_cliente:
         coluna_preco_cliente = "preco_entrega"
 
-    # DEBUG: Remova após testar, ajuda a ver o que está acontecendo
-    # st.write(f"Debug: Coluna do Cliente = {coluna_preco_cliente}")
-
     opcoes_recebimento = ["Retirada no centro de distribuição", "Entrega"]
     
+    # ============================================================
+    # 3. SELEÇÃO COM TRAVA DE SEGURANÇA
+    # ============================================================
     forma_recebimento = st.radio(
         "Como deseja receber os produtos?",
         opcoes_recebimento,
-        key="forma_recebimento_cotacao"
+        key="forma_recebimento_cotacao",
+        disabled=tem_itens_no_carrinho, # <--- TRAVA O BOTÃO SE TIVER ITENS
+        help="Para alterar a forma de entrega, remova os itens da cotação atual."
     )
 
+    # Feedback visual para o usuário entender
+    if tem_itens_no_carrinho:
+        st.caption("🔒 *Para mudar a forma de entrega, clique em 'Limpar Tudo' no final da página.*")
+
     if forma_recebimento == "Retirada no centro de distribuição":
-        # Corrigido para "preco_retira" para bater com o nome real da coluna no banco
+        # Corrigido para "preco_retira" para bater com o banco
         coluna_preco = "preco_retira" 
     else:
-        # Se for entrega, usa a coluna baseada na distância (Ex: preco_100a199km)
+        # Se for entrega, usa a coluna baseada na distância
         coluna_preco = coluna_preco_cliente
-    
     
     pode_ver_preco = bool(cliente.get('visualiza_preco', True))
     
@@ -2298,6 +2312,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
