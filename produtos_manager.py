@@ -1,6 +1,7 @@
 """
 Módulo para gerenciar leitura, validação e sincronização de produtos
 com Supabase. Suporta CSV, XLS e XLSX com normalização de colunas.
+ATUALIZADO: Com proteção contra duplicatas e uso de UPSERT.
 """
 
 import pandas as pd
@@ -9,7 +10,7 @@ import re
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 import streamlit as st
-
+from datetime import datetime, timezone # Adicionado para garantir datas corretas
 
 # =====================================================================
 # CONFIGURAÇÕES E CONSTANTES
@@ -27,7 +28,6 @@ MAPA_COLUNAS = {
     'sku': 'codigo',
     'product_code': 'codigo',
     'productcode': 'codigo',
-    
     
     # Produto/Nome
     'produto_1': 'produto',
@@ -118,13 +118,8 @@ MAPA_COLUNAS = {
     'valor': 'preco_padrao',
 }
 
-# Colunas obrigatórias mínimas
 COLUNAS_OBRIGATORIAS = ['codigo', 'produto']
-
-# Colunas altamente recomendadas
 COLUNAS_RECOMENDADAS = ['codigo', 'produto', 'unidade', 'retira', 'entrega']
-
-# Extensões suportadas
 EXTENSOES_SUPORTADAS = ['.csv', '.xls', '.xlsx']
 
 
@@ -133,15 +128,10 @@ EXTENSOES_SUPORTADAS = ['.csv', '.xls', '.xlsx']
 # =====================================================================
 
 def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
-    """
-    Lê arquivo CSV ou Excel com múltiplas estratégias de encoding.
-    Retorna DataFrame ou None se falhar.
-    """
+    """Lê arquivo CSV ou Excel com múltiplas estratégias."""
     try:
         nome_arquivo = arquivo.name.lower()
-        
         if nome_arquivo.endswith('.csv'):
-            # Tenta diferentes combinações de separador e encoding
             tentativas = [
                 {'sep': ',', 'encoding': 'utf-8', 'decimal': '.'},
                 {'sep': ',', 'encoding': 'latin1', 'decimal': ','},
@@ -149,36 +139,23 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
                 {'sep': ';', 'encoding': 'latin1', 'decimal': ','},
                 {'sep': '\t', 'encoding': 'utf-8', 'decimal': '.'},
             ]
-            
             df = None
             erro_detalhado = None
-            
             for tentativa in tentativas:
                 try:
-                    arquivo.seek(0)  # Volta ao início do arquivo
+                    arquivo.seek(0)
                     df = pd.read_csv(arquivo, **tentativa)
                     if not df.empty and len(df.columns) > 1:
                         return df
                 except Exception as e:
                     erro_detalhado = str(e)
                     continue
-            
             if df is None:
-                raise ValueError(
-                    f"Não foi possível ler o CSV. "
-                    f"Verifique separadores (vírgula, ponto-e-vírgula ou tab) "
-                    f"e encoding (UTF-8 ou Latin1). Erro: {erro_detalhado}"
-                )
-                
+                raise ValueError(f"Erro ao ler CSV. Detalhe: {erro_detalhado}")
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
-            # Para Excel, tenta ler a primeira aba
             tentativas_excel = [
-                {'sheet_name': 0},
-                {'sheet_name': 'produtos'},
-                {'sheet_name': 'Produtos'},
-                {'sheet_name': 'Sheet1'},
+                {'sheet_name': 0}, {'sheet_name': 'produtos'}, {'sheet_name': 'Produtos'}, {'sheet_name': 'Sheet1'}
             ]
-            
             for tentativa in tentativas_excel:
                 try:
                     arquivo.seek(0)
@@ -187,210 +164,214 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
                         return df
                 except Exception:
                     continue
-            
-            raise ValueError(
-                "Não foi possível ler o arquivo Excel. "
-                "Verifique se tem dados na primeira aba ou em abas nomeadas 'produtos'."
-            )
+            raise ValueError("Erro ao ler Excel.")
         else:
-            raise ValueError(
-                f"Formato não suportado: {Path(nome_arquivo).suffix}. "
-                f"Use CSV, XLS ou XLSX."
-            )
-            
+            raise ValueError(f"Formato {Path(nome_arquivo).suffix} não suportado.")
     except Exception as e:
-        raise Exception(f"Erro ao ler arquivo: {str(e)}")
+        raise Exception(f"Erro na leitura: {str(e)}")
 
 
 def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza nomes de colunas:
-    1. Remove espaços, converte para minúsculas
-    2. Remove caracteres especiais
-    3. Aplica mapa de correção
-    4. Retorna DataFrame com colunas padronizadas
-    """
-    # Função auxiliar para limpar nome de coluna
+    """Padroniza nomes das colunas."""
     def limpar_coluna(col: str) -> str:
-        """Remove espaços, caracteres especiais e converte para minúscula"""
         col = str(col).strip().lower()
-        # Remove acentos
         col = re.sub(r'[àáâãäå]', 'a', col)
         col = re.sub(r'[èéêë]', 'e', col)
         col = re.sub(r'[ìíîï]', 'i', col)
         col = re.sub(r'[òóôõö]', 'o', col)
         col = re.sub(r'[ùúûü]', 'u', col)
         col = re.sub(r'[ç]', 'c', col)
-        # Remove caracteres especiais mas mantém underscore
         col = re.sub(r'[^a-z0-9_]', '', col)
-        # Remove underscores múltiplos
         col = re.sub(r'_+', '_', col)
-        # Remove underscores nas pontas
-        col = col.strip('_')
-        return col
+        return col.strip('_')
     
-    # Limpa todos os nomes de colunas
     df.columns = [limpar_coluna(col) for col in df.columns]
-    
-    # Aplica o mapa de correção
     df = df.rename(columns=MAPA_COLUNAS)
-    
     return df
 
 
 def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    """
-    Valida se DataFrame tem estrutura mínima aceitável.
-    Retorna (válido: bool, mensagens: List[str])
-    """
+    """Valida estrutura mínima."""
     mensagens = []
-    
-    # Verifica colunas obrigatórias
     faltando = [col for col in COLUNAS_OBRIGATORIAS if col not in df.columns]
     if faltando:
-        mensagens.append(
-            f"❌ Colunas obrigatórias faltando: {', '.join(faltando)}"
-        )
-    
-    # Verifica se tem linhas
+        mensagens.append(f"❌ Colunas obrigatórias faltando: {', '.join(faltando)}")
     if df.empty:
-        mensagens.append("❌ Arquivo vazio ou sem dados.")
+        mensagens.append("❌ Arquivo vazio.")
     
-    # Valida tipos de dados
-    validacoes_tipo = {
-        'codigo': lambda x: str(x).strip() != '',
-        'produto': lambda x: str(x).strip() != '',
-    }
-    
-    for coluna, validador in validacoes_tipo.items():
-        if coluna in df.columns:
-            linhas_invalidas = df[~df[coluna].apply(validador)].index.tolist()
-            if linhas_invalidas:
-                mensagens.append(
-                    f"⚠️ {len(linhas_invalidas)} linhas com {coluna} vazio(s)"
-                )
-    
-    # Aviso de colunas faltando (não-obrigatórias mas recomendadas)
-    faltando_recomendadas = [
-        col for col in COLUNAS_RECOMENDADAS 
-        if col not in df.columns and col not in COLUNAS_OBRIGATORIAS
-    ]
-    if faltando_recomendadas:
-        mensagens.append(
-            f"⚠️ Colunas recomendadas faltando: {', '.join(faltando_recomendadas)}"
-        )
-    
-    valido = len([m for m in mensagens if m.startswith('❌')]) == 0
-    
-    return valido, mensagens
+    validacoes = {'codigo': lambda x: str(x).strip() != '', 'produto': lambda x: str(x).strip() != ''}
+    for col, val in validacoes.items():
+        if col in df.columns:
+            if not df[df[col].apply(val)].shape[0] == df.shape[0]:
+                mensagens.append(f"⚠️ Existem linhas com {col} vazio.")
+                
+    return len([m for m in mensagens if m.startswith('❌')]) == 0, mensagens
 
 
 def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Limpa dados: remove linhas vazias, normaliza preços e garante unicidade do código.
+    Limpa dados e garante UNICIDADE DO CÓDIGO para evitar erros de banco.
     """
-    # Remove linhas completamente vazias
-    df = df.dropna(how='all')
+    df = df.dropna(how='all').reset_index(drop=True)
     
-    # Reseta índice
-    df = df.reset_index(drop=True)
-    
-    # --- CORREÇÃO PRINCIPAL AQUI ---
-    # Normaliza a coluna 'codigo' para garantir que '7726' (int) e '7726' (str) sejam iguais
+    # 1. FORÇA O CÓDIGO PARA STRING AGORA (Vital para evitar duplicatas mistas)
     if 'codigo' in df.columns:
-        # Converte para string e remove espaços extras
+        # Converte tudo para string e remove espaços
         df['codigo'] = df['codigo'].apply(lambda x: str(x).strip() if pd.notna(x) else "")
-        # Remove códigos vazios que possam ter restado
+        # Remove vazios
         df = df[df['codigo'] != ""]
         
+        # Remove duplicatas exatas de código
         tamanho_antes = len(df)
-        # Agora o drop_duplicates vai funcionar independente da formatação no Excel
         df = df.drop_duplicates(subset=['codigo'], keep='first')
         
         if len(df) < tamanho_antes:
-            st.warning(f"⚠️ {tamanho_antes - len(df)} linhas com códigos duplicados foram removidas.")
+            st.warning(f"⚠️ {tamanho_antes - len(df)} códigos duplicados foram removidos da planilha.")
 
-    # Remove espaços em branco das outras células de texto
+    # 2. Limpa textos gerais
     for col in df.select_dtypes(include=['object']).columns:
-        if col != 'codigo': # Já tratamos o código acima
-            df[col] = df[col].apply(
-                lambda x: str(x).strip() if pd.notna(x) else x
-            )
+        if col != 'codigo': 
+            df[col] = df[col].apply(lambda x: str(x).strip() if pd.notna(x) else x)
     
-    # Limpa colunas de preço
-    colunas_preco = ['retira', 'entrega', 'preco_padrao', 'preco_unitario']
+    # 3. Limpa preços
     for col in df.columns:
-        if any(preco in col.lower() for preco in ['preco', 'retira', 'entrega', 'price', 'value']):
+        if any(p in col.lower() for p in ['preco', 'retira', 'entrega', 'price', 'value']):
             df[col] = df[col].apply(converter_preco)
-    
+            
     return df
 
+
 def converter_preco(valor) -> float:
-    """
-    Converte valor para float, tratando múltiplos formatos:
-    - "1.234,56" (brasileiro) -> 1234.56
-    - "1,234.56" (americano) -> 1234.56
-    - "1234.56" (padrão) -> 1234.56
-    - "R$ 1.000,00" -> 1000.00
-    """
-    if valor is None or (isinstance(valor, float) and np.isnan(valor)):
-        return 0.0
+    """Converte strings financeiras para float."""
+    if valor is None or (isinstance(valor, float) and np.isnan(valor)): return 0.0
+    if isinstance(valor, (int, float)): return float(valor)
+    texto = str(valor).replace('R$', '').replace(' ', '').strip()
+    if not texto or texto in ['-', 'n/a']: return 0.0
     
-    if isinstance(valor, (int, float)):
-        return float(valor)
-    
-    texto = str(valor).strip()
-    
-    # Remove R$, espaços
-    texto = texto.replace('R$', '').replace(' ', '').strip()
-    
-    if not texto or texto == '-' or texto.lower() == 'n/a':
-        return 0.0
-    
-    # Detecta se é formato brasileiro ou americano
-    # Se tiver ponto E vírgula: deve ser brasileiro (1.000,00)
     if ',' in texto and '.' in texto:
-        if texto.rindex(',') > texto.rindex('.'):
-            # Brasileiro: 1.000,00
-            texto = texto.replace('.', '').replace(',', '.')
-        else:
-            # Americano: 1,000.00
-            texto = texto.replace(',', '')
-    elif ',' in texto:
-        # Só tem vírgula, assume brasileiro
-        texto = texto.replace(',', '.')
+        if texto.rindex(',') > texto.rindex('.'): texto = texto.replace('.', '').replace(',', '.') # BR
+        else: texto = texto.replace(',', '') # US
+    elif ',' in texto: texto = texto.replace(',', '.') # BR simples
     
-    try:
-        return float(texto)
-    except ValueError:
-        return 0.0
+    try: return float(texto)
+    except: return 0.0
 
 
 def processar_arquivo_produtos(arquivo) -> Optional[pd.DataFrame]:
+    """Pipeline completo de processamento."""
+    try:
+        df = ler_arquivo(arquivo)
+        df = normalizar_colunas(df)
+        valido, msgs = validar_dados(df)
+        for msg in msgs:
+            if msg.startswith('❌'): st.error(msg)
+            else: st.warning(msg)
+        
+        if not valido: return None
+        
+        df = limpar_dados(df)
+        
+        if 'updated_at' not in df.columns:
+            df['updated_at'] = datetime.now(timezone.utc).isoformat()
+            
+        st.success(f"✅ Arquivo processado: {len(df)} produtos prontos.")
+        return df
+    except Exception as e:
+        st.error(f"❌ Erro ao processar: {str(e)}")
+        return None
+
+
+# =====================================================================
+# FUNÇÕES DE SINCRONIZAÇÃO COM SUPABASE (CORRIGIDA)
+# =====================================================================
+
+def sincronizar_produtos_supabase(
+    supabase_client,
+    df: pd.DataFrame,
+    tabela: str = 'produtos',
+    limpar_antes: bool = False, # Mudado padrão para False para segurança
+    representante_id: str = None
+) -> Tuple[bool, str]:
     """
-    Pipeline completo: ler -> normalizar -> validar -> limpar
-    Retorna DataFrame pronto para Supabase ou None se falhar.
+    Sincroniza produtos usando UPSERT (Atualização inteligente).
+    Resolve erros de chave duplicada e violação de chave estrangeira.
     """
     try:
-        # 1. Ler arquivo
-        df = ler_arquivo(arquivo)
+        # ATENÇÃO: Ignoramos 'limpar_antes' aqui propositalmente para evitar 
+        # o erro de chave estrangeira (FK Constraint) se houver cotações ativas.
+        # Em vez de apagar, vamos apenas atualizar (Upsert).
         
-        # 2. Normalizar colunas
-        df = normalizar_colunas(df)
+        # Garante ID do representante
+        if representante_id:
+            df['representante_id'] = representante_id
         
-        # 3. Validar
-        valido, mensagens = validar_dados(df)
-        for msg in mensagens:
-            if msg.startswith('❌'):
-                st.error(msg)
-            else:
-                st.warning(msg)
+        # Atualiza timestamp
+        df['updated_at'] = datetime.now(timezone.utc).isoformat()
+
+        # Prepara colunas permitidas (Evita erro se Excel tiver sujeira)
+        colunas_db = [
+            'representante_id', 'codigo', 'produto', 'unidade',
+            'preco_retira', 'preco_entrega', 
+            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
+            'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
+            'updated_at'
+        ]
         
-        if not valido:
-            return None
+        # Converte para lista de dicionários limpos
+        records = []
+        for _, row in df.iterrows():
+            item = {}
+            for col in colunas_db:
+                if col in df.columns:
+                    val = row[col]
+                    # Trata NaN/NaT
+                    if pd.isna(val) or val == "":
+                        val = None
+                    item[col] = val
+            records.append(item)
+            
+        if not records:
+            return True, "Nenhum dado para importar."
+
+        # Processamento em Lotes com UPSERT
+        TAMANHO_LOTE = 100
+        sucesso = 0
+        barra = st.progress(0)
         
-        # 4. Limpar
-        df = limpar_dados(df)
+        for i in range(0, len(records), TAMANHO_LOTE):
+            lote = records[i:i+TAMANHO_LOTE]
+            try:
+                # --- A MÁGICA: UPSERT ---
+                # on_conflict='representante_id, codigo' diz ao banco:
+                # "Se essa combinação já existir, atualize os outros campos. Se não, crie novo."
+                supabase_client.table(tabela).upsert(
+                    lote, 
+                    on_conflict='representante_id, codigo'
+                ).execute()
+                
+                sucesso += len(lote)
+            except Exception as e:
+                erro_msg = str(e)
+                print(f"Erro Lote {i}: {erro_msg}")
+                st.error(f"Erro no lote {i//TAMANHO_LOTE + 1}: {erro_msg}")
+                # Continua tentando os próximos lotes
+            
+            barra.progress(min((i + TAMANHO_LOTE) / len(records), 1.0))
+            
+        return True, f"✅ Sincronização concluída! {sucesso} produtos atualizados/criados."
+
+    except Exception as e:
+        return False, f"❌ Erro crítico na sincronização: {str(e)}"
+
+
+def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
+    """Exibe preview dos dados carregados"""
+    st.subheader("📋 Preview dos Dados")
+    with st.expander("Ver estrutura", expanded=False):
+        col1, col2 = st.columns(2)
+        col1.metric("Linhas", len(df))
+        col2.metric("Colunas", len(df.columns))
+    st.dataframe(df.head(max_linhas), use_container_width=True)
         
         # 5. Adicionar timestamp se não tiver
         if 'updated_at' not in df.columns:
@@ -542,5 +523,6 @@ def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
     
     st.write("**Primeiras linhas:**")
     st.dataframe(df.head(max_linhas), use_container_width=True)
+
 
 
