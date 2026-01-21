@@ -1815,13 +1815,19 @@ def pagina_nova_cotacao(cliente):
 
     # Forma de recebimento - cliente escolhe apenas Retirada ou Entrega
     # A coluna de preço é automaticamente definida pela distância cadastrada
-    coluna_preco_cliente = cliente.get("colunapreco") or "preco_entrega"
+    # --- CORREÇÃO AQUI ---
+    # 1. Busca o nome da coluna correta usando a chave com underscore (como está no banco)
+    coluna_preco_cliente = cliente.get("coluna_preco")
     
-    # DEBUG TEMPORÁRIO - remova depois de testar
-    st.caption(f"🔍 Debug: Coluna de preço do cliente = {coluna_preco_cliente}")
-    
+    # Se por acaso estiver vazio, definimos o padrão
+    if not coluna_preco_cliente:
+        coluna_preco_cliente = "preco_entrega"
+
+    # DEBUG: Remova após testar, ajuda a ver o que está acontecendo
+    # st.write(f"Debug: Coluna do Cliente = {coluna_preco_cliente}")
+
     opcoes_recebimento = ["Retirada no centro de distribuição", "Entrega"]
-    # ... resto do código
+    
     forma_recebimento = st.radio(
         "Como deseja receber os produtos?",
         opcoes_recebimento,
@@ -1829,9 +1835,12 @@ def pagina_nova_cotacao(cliente):
     )
 
     if forma_recebimento == "Retirada no centro de distribuição":
-        coluna_preco = "precoretira"
+        # Corrigido para "preco_retira" para bater com o nome real da coluna no banco
+        coluna_preco = "preco_retira" 
     else:
+        # Se for entrega, usa a coluna baseada na distância (Ex: preco_100a199km)
         coluna_preco = coluna_preco_cliente
+    
     
     pode_ver_preco = bool(cliente.get('visualiza_preco', True))
     
@@ -2289,6 +2298,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
