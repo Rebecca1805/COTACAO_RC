@@ -591,16 +591,16 @@ def buscar_produtos(representante_id, termo):
 
 def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
     """
-    Retorna o preço do produto baseado na coluna de preço do cliente
+    Retorna o preço do produto baseado na coluna de preço do cliente 
     e forma de recebimento (retirada ou entrega com múltiplas distâncias)
     """
     if forma_recebimento == 'Retirada no centro de distribuição':
-        preco = produto_row.get('preco_retira')
+        preco = produto_row.get('precoretira')
     else:
-        # Entrega - usa a coluna de preço baseada na distância
         preco = produto_row.get(coluna_preco)
     
     return preco if preco and not pd.isna(preco) else None
+
 
 def obter_opcoes_distancia():
     """
@@ -1816,8 +1816,12 @@ def pagina_nova_cotacao(cliente):
     # Forma de recebimento - cliente escolhe apenas Retirada ou Entrega
     # A coluna de preço é automaticamente definida pela distância cadastrada
     coluna_preco_cliente = cliente.get("colunapreco") or "precoentrega"
-
+    
+    # DEBUG TEMPORÁRIO - remova depois de testar
+    st.caption(f"🔍 Debug: Coluna de preço do cliente = {coluna_preco_cliente}")
+    
     opcoes_recebimento = ["Retirada no centro de distribuição", "Entrega"]
+    # ... resto do código
     forma_recebimento = st.radio(
         "Como deseja receber os produtos?",
         opcoes_recebimento,
@@ -2285,6 +2289,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
