@@ -294,157 +294,104 @@ def local_css():
     """, unsafe_allow_html=True)
 
 # =====================================================================
-# FUNÇÕES AUXILIARES
+# FUNÇÕES GERAIS E SEGURANÇA
 # =====================================================================
 
 def so_digitos(valor):
     """Remove tudo que não for número"""
-    if pd.isna(valor):
-        return ""
+    if pd.isna(valor): return ""
     return re.sub(r'\D', '', str(valor))
 
 def parse_preco(valor):
-    """Converte string tipo '18,14' em float 18.14"""
-    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
-        return None
-    s = str(valor).strip()
-    if not s:
-        return None
-    try:
-        s = s.replace('.', '').replace(',', '.')
-        return float(s)
-    except (ValueError, AttributeError):
-        return None
+    """(Alias para manter compatibilidade)"""
+    return parse_money(valor)
 
-# =====================================================================
-# FUNÇÕES DE AUTENTICAÇÃO
-# =====================================================================
+def parse_money(valor):
+    """Converte string de dinheiro BR para float"""
+    if valor is None or pd.isna(valor) or valor == "": return 0.0
+    if isinstance(valor, (int, float)): return float(valor)
+    texto = str(valor).strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
+    try: return float(texto)
+    except ValueError: return 0.0
 
 def hash_senha(senha):
-    """Gera hash da senha com bcrypt"""
+    """Gera hash da senha"""
     return bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verificar_senha(senha, senha_hash):
-    """Verifica se a senha está correta"""
-    try:
-        return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
-    except (ValueError, AttributeError) as e:
-        return False
+    """Verifica senha"""
+    try: return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
+    except: return False
 
-# ---------------------------------------------------------------------
-# REPRESENTANTE - Autenticação com Supabase Auth
-# ---------------------------------------------------------------------
+# =====================================================================
+# AUTENTICAÇÃO - REPRESENTANTE (Mantido original)
+# =====================================================================
 
 def autenticar_representante(email, senha):
-    """
-    Autentica representante usando Supabase Auth
-    Retorna: (dados_representante, mensagem) ou (None, mensagem_erro)
-    """
     try:
-        response = supabase.auth.sign_in_with_password({
-            "email": email,
-            "password": senha
-        })
-        
+        response = supabase.auth.sign_in_with_password({"email": email, "password": senha})
         user_id = response.user.id
         rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
-        
         return rep_data.data, "Login realizado com sucesso!"
-    
-    except Exception as e:
-        return None, f"Usuário ou senha incorretos"
+    except: return None, "Usuário ou senha incorretos"
 
 def cadastrar_representante(nome, email, senha, telefone):
-    """
-    Cadastra novo representante
-    1. Cria usuário no Supabase Auth
-    2. Insere linha na tabela representantes
-    """
     try:
-        response = supabase.auth.sign_up({
-            "email": email,
-            "password": senha
-        })
-        
-        user_id = response.user.id
-        
+        response = supabase.auth.sign_up({"email": email, "password": senha})
         supabase.table('representantes').insert({
-            'id': user_id,
-            'nome': nome,
-            'email': email,
-            'telefone': telefone
+            'id': response.user.id, 'nome': nome, 'email': email, 'telefone': telefone
         }).execute()
-        
         return True, "Representante cadastrado com sucesso!"
-    
-    except Exception as e:
-        return False, f"Erro ao cadastrar: {str(e)}"
+    except Exception as e: return False, f"Erro ao cadastrar: {str(e)}"
 
-# ---------------------------------------------------------------------
-# CLIENTE - Autenticação por CNPJ/Telefone
-# ---------------------------------------------------------------------
+# =====================================================================
+# AUTENTICAÇÃO E LÓGICA - CLIENTE (Aqui está a correção!)
+# =====================================================================
 
-def autenticar_cliente(cnpj_ou_telefone, senha):
-    """
-    Busca cliente por CNPJ ou telefone no banco
-    Valida senha com bcrypt
-    Retorna: (dados_cliente, mensagem) ou (None, mensagem_erro)
-    """
-    identificador = so_digitos(cnpj_ou_telefone)
+def autenticar_cliente(identificador, senha):
+    """Busca cliente por CNPJ/Tel e valida senha"""
+    id_limpo = so_digitos(identificador)
+    if not id_limpo: return None, "Digite apenas números."
     
     try:
-        response = supabase.table('clientes').select('*').or_(
-            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
-        ).execute()
-        
-        if not response.data:
-            return None, "Cliente não encontrado"
+        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
+        if not response.data: return None, "Cliente não encontrado."
         
         cliente = response.data[0]
+        if not cliente.get('senha_hash'): return None, "Conta não ativada. Crie sua senha primeiro."
         
-        if not cliente.get('senha_hash'):
-            return None, "Cliente ainda não criou senha. Use 'Primeiro Acesso'"
-        
-        if verificar_senha(senha, cliente['senha_hash']):
-            return cliente, "Login realizado com sucesso!"
-        else:
-            return None, "Senha incorreta"
-    
-    except Exception as e:
-        return None, f"Erro no login: {str(e)}"
+        if verificar_senha(senha, cliente['senha_hash']): return cliente, "Login com sucesso!"
+        else: return None, "Senha incorreta."
+    except Exception as e: return None, f"Erro: {e}"
 
-def buscar_cliente_para_cadastro(cnpj_ou_telefone):
-    """
-    Busca cliente sem senha na base (para primeiro acesso)
-    Retorna: (cliente, representante_id) ou (None, None)
-    """
-    identificador = so_digitos(cnpj_ou_telefone)
+def ativar_senha_cliente(identificador, nova_senha):
+    """Busca cliente por CNPJ/Tel e grava nova senha"""
+    id_limpo = so_digitos(identificador)
+    if not id_limpo: return False, "Identificador inválido."
     
     try:
-        response = supabase.table('clientes').select('*').or_(
-            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
-        ).execute()
-        
-        if not response.data:
-            return None, None
+        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
+        if not response.data: return False, "Cliente não encontrado na base."
         
         cliente = response.data[0]
-        return cliente, cliente['representante_id']
-    
-    except Exception as e:
-        return None, None
+        supabase.table('clientes').update({'senha_hash': hash_senha(nova_senha)}).eq('id', cliente['id']).execute()
+        return True, "Senha criada com sucesso!"
+    except Exception as e: return False, f"Erro: {e}"
+
+# Mantemos estas por compatibilidade caso seu código antigo use
+def buscar_cliente_para_cadastro(identificador):
+    id_limpo = so_digitos(identificador)
+    try:
+        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
+        if response.data: return response.data[0], response.data[0]['representante_id']
+    except: pass
+    return None, None
 
 def criar_senha_cliente(cliente_id, senha):
-    """Atualiza cliente com senha hash"""
     try:
-        supabase.table('clientes').update({
-            'senha_hash': hash_senha(senha)
-        }).eq('id', cliente_id).execute()
-        
-        return True, "Conta criada com sucesso!"
-    
-    except Exception as e:
-        return False, f"Erro ao criar senha: {str(e)}"
+        supabase.table('clientes').update({'senha_hash': hash_senha(senha)}).eq('id', cliente_id).execute()
+        return True, "Senha criada!"
+    except Exception as e: return False, str(e)
 
 # =====================================================================
 # FUNÇÕES DE DADOS - CLIENTES
@@ -2339,6 +2286,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
