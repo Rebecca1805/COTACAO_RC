@@ -595,7 +595,7 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
     e forma de recebimento (retirada ou entrega com múltiplas distâncias)
     """
     if forma_recebimento == 'Retirada no centro de distribuição':
-        preco = produto_row.get('precoretira')
+        preco = produto_row.get('preco_retira')
     else:
         preco = produto_row.get(coluna_preco)
     
@@ -2289,6 +2289,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
