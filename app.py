@@ -294,104 +294,157 @@ def local_css():
     """, unsafe_allow_html=True)
 
 # =====================================================================
-# FUNÇÕES GERAIS E SEGURANÇA
+# FUNÇÕES AUXILIARES
 # =====================================================================
 
 def so_digitos(valor):
     """Remove tudo que não for número"""
-    if pd.isna(valor): return ""
+    if pd.isna(valor):
+        return ""
     return re.sub(r'\D', '', str(valor))
 
 def parse_preco(valor):
-    """(Alias para manter compatibilidade)"""
-    return parse_money(valor)
+    """Converte string tipo '18,14' em float 18.14"""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+    s = str(valor).strip()
+    if not s:
+        return None
+    try:
+        s = s.replace('.', '').replace(',', '.')
+        return float(s)
+    except (ValueError, AttributeError):
+        return None
 
-def parse_money(valor):
-    """Converte string de dinheiro BR para float"""
-    if valor is None or pd.isna(valor) or valor == "": return 0.0
-    if isinstance(valor, (int, float)): return float(valor)
-    texto = str(valor).strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
-    try: return float(texto)
-    except ValueError: return 0.0
+# =====================================================================
+# FUNÇÕES DE AUTENTICAÇÃO
+# =====================================================================
 
 def hash_senha(senha):
-    """Gera hash da senha"""
+    """Gera hash da senha com bcrypt"""
     return bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verificar_senha(senha, senha_hash):
-    """Verifica senha"""
-    try: return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
-    except: return False
+    """Verifica se a senha está correta"""
+    try:
+        return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
+    except (ValueError, AttributeError) as e:
+        return False
 
-# =====================================================================
-# AUTENTICAÇÃO - REPRESENTANTE (Mantido original)
-# =====================================================================
+# ---------------------------------------------------------------------
+# REPRESENTANTE - Autenticação com Supabase Auth
+# ---------------------------------------------------------------------
 
 def autenticar_representante(email, senha):
+    """
+    Autentica representante usando Supabase Auth
+    Retorna: (dados_representante, mensagem) ou (None, mensagem_erro)
+    """
     try:
-        response = supabase.auth.sign_in_with_password({"email": email, "password": senha})
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": senha
+        })
+        
         user_id = response.user.id
         rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
+        
         return rep_data.data, "Login realizado com sucesso!"
-    except: return None, "Usuário ou senha incorretos"
+    
+    except Exception as e:
+        return None, f"Usuário ou senha incorretos"
 
 def cadastrar_representante(nome, email, senha, telefone):
+    """
+    Cadastra novo representante
+    1. Cria usuário no Supabase Auth
+    2. Insere linha na tabela representantes
+    """
     try:
-        response = supabase.auth.sign_up({"email": email, "password": senha})
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": senha
+        })
+        
+        user_id = response.user.id
+        
         supabase.table('representantes').insert({
-            'id': response.user.id, 'nome': nome, 'email': email, 'telefone': telefone
+            'id': user_id,
+            'nome': nome,
+            'email': email,
+            'telefone': telefone
         }).execute()
+        
         return True, "Representante cadastrado com sucesso!"
-    except Exception as e: return False, f"Erro ao cadastrar: {str(e)}"
+    
+    except Exception as e:
+        return False, f"Erro ao cadastrar: {str(e)}"
 
-# =====================================================================
-# AUTENTICAÇÃO E LÓGICA - CLIENTE (Aqui está a correção!)
-# =====================================================================
+# ---------------------------------------------------------------------
+# CLIENTE - Autenticação por CNPJ/Telefone
+# ---------------------------------------------------------------------
 
-def autenticar_cliente(identificador, senha):
-    """Busca cliente por CNPJ/Tel e valida senha"""
-    id_limpo = so_digitos(identificador)
-    if not id_limpo: return None, "Digite apenas números."
+def autenticar_cliente(cnpj_ou_telefone, senha):
+    """
+    Busca cliente por CNPJ ou telefone no banco
+    Valida senha com bcrypt
+    Retorna: (dados_cliente, mensagem) ou (None, mensagem_erro)
+    """
+    identificador = so_digitos(cnpj_ou_telefone)
     
     try:
-        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if not response.data: return None, "Cliente não encontrado."
+        response = supabase.table('clientes').select('*').or_(
+            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
+        ).execute()
+        
+        if not response.data:
+            return None, "Cliente não encontrado"
         
         cliente = response.data[0]
-        if not cliente.get('senha_hash'): return None, "Conta não ativada. Crie sua senha primeiro."
         
-        if verificar_senha(senha, cliente['senha_hash']): return cliente, "Login com sucesso!"
-        else: return None, "Senha incorreta."
-    except Exception as e: return None, f"Erro: {e}"
+        if not cliente.get('senha_hash'):
+            return None, "Cliente ainda não criou senha. Use 'Primeiro Acesso'"
+        
+        if verificar_senha(senha, cliente['senha_hash']):
+            return cliente, "Login realizado com sucesso!"
+        else:
+            return None, "Senha incorreta"
+    
+    except Exception as e:
+        return None, f"Erro no login: {str(e)}"
 
-def ativar_senha_cliente(identificador, nova_senha):
-    """Busca cliente por CNPJ/Tel e grava nova senha"""
-    id_limpo = so_digitos(identificador)
-    if not id_limpo: return False, "Identificador inválido."
+def buscar_cliente_para_cadastro(cnpj_ou_telefone):
+    """
+    Busca cliente sem senha na base (para primeiro acesso)
+    Retorna: (cliente, representante_id) ou (None, None)
+    """
+    identificador = so_digitos(cnpj_ou_telefone)
     
     try:
-        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if not response.data: return False, "Cliente não encontrado na base."
+        response = supabase.table('clientes').select('*').or_(
+            f'cnpj.eq.{identificador},telefone.eq.{identificador}'
+        ).execute()
+        
+        if not response.data:
+            return None, None
         
         cliente = response.data[0]
-        supabase.table('clientes').update({'senha_hash': hash_senha(nova_senha)}).eq('id', cliente['id']).execute()
-        return True, "Senha criada com sucesso!"
-    except Exception as e: return False, f"Erro: {e}"
-
-# Mantemos estas por compatibilidade caso seu código antigo use
-def buscar_cliente_para_cadastro(identificador):
-    id_limpo = so_digitos(identificador)
-    try:
-        response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if response.data: return response.data[0], response.data[0]['representante_id']
-    except: pass
-    return None, None
+        return cliente, cliente['representante_id']
+    
+    except Exception as e:
+        return None, None
 
 def criar_senha_cliente(cliente_id, senha):
+    """Atualiza cliente com senha hash"""
     try:
-        supabase.table('clientes').update({'senha_hash': hash_senha(senha)}).eq('id', cliente_id).execute()
-        return True, "Senha criada!"
-    except Exception as e: return False, str(e)
+        supabase.table('clientes').update({
+            'senha_hash': hash_senha(senha)
+        }).eq('id', cliente_id).execute()
+        
+        return True, "Conta criada com sucesso!"
+    
+    except Exception as e:
+        return False, f"Erro ao criar senha: {str(e)}"
 
 # =====================================================================
 # FUNÇÕES DE DADOS - CLIENTES
@@ -1198,14 +1251,27 @@ def pagina_upload_tabela_precos(representante_id):
         with col1:
             st.metric("📦 Produtos", len(produtos))
         with col2:
-            preco_medio = produtos[['retira', 'entrega']].astype(float).mean().mean()
-            st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
+            # CORREÇÃO: Usando 'preco_retira' e 'preco_entrega' (nomes do banco)
+            cols_calc = ['preco_retira', 'preco_entrega']
+            # Garante que as colunas existem antes de calcular
+            cols_existentes = [c for c in cols_calc if c in produtos.columns]
+            
+            if cols_existentes:
+                preco_medio = produtos[cols_existentes].fillna(0).astype(float).mean().mean()
+                st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
+            else:
+                st.metric("💰 Preço Médio", "R$ 0,00")
+
         with col3:
-            st.metric("⚠️ Sem Preço", 
-                (produtos[['retira', 'entrega']].astype(float) == 0).sum().sum())
+            if cols_existentes:
+                qtd_sem_preco = (produtos[cols_existentes].fillna(0).astype(float) == 0).sum().sum()
+                st.metric("⚠️ Sem Preço", qtd_sem_preco)
+            else:
+                st.metric("⚠️ Sem Preço", 0)
         
         with st.expander("👁️ Visualizar tabela atual", expanded=False):
-            cols_view = ['codigo', 'produto', 'unidade', 'retira', 'entrega']
+            # CORREÇÃO: Ajustando nomes para visualização também
+            cols_view = ['codigo', 'produto', 'unidade', 'preco_retira', 'preco_entrega']
             cols_disponiveis = [c for c in cols_view if c in produtos.columns]
             st.dataframe(produtos[cols_disponiveis].head(50), use_container_width=True)
         
@@ -1254,7 +1320,7 @@ def pagina_upload_tabela_precos(representante_id):
                 st.write("✅ Arquivo processado com sucesso e pronto para sincronizar!")
             
             with col2:
-                if st.button("🚀 Atualizar Sistema", type="primary", key="btn_sincronizar"):
+                if st.button("🚀 Atualizar Dados", type="primary", key="btn_sincronizar"):
                     with st.spinner("⏳ Sincronizando produtos..."):
                         sucesso, mensagem = sincronizar_produtos_supabase(
                             supabase_client=supabase,
@@ -2133,89 +2199,100 @@ def pagina_meus_pedidos(cliente):
 # PÁGINA DO CLIENTE (COM CORREÇÃO DE SEGURANÇA)
 # =====================================================================
 def pagina_cliente():
-    """Página principal do cliente - VERSÃO CORRIGIDA (CNPJ/TELEFONE)"""
+    """Página principal do cliente"""
     local_css()
     
     if 'cliente_logado' not in st.session_state:
         st.session_state.cliente_logado = None
     
-    # --- VERIFICAÇÃO DE SEGURANÇA (Mantida) ---
-    # Confere se o cliente ainda tem permissão no banco
-    if st.session_state.cliente_logado:
-        try:
-            c_id = st.session_state.cliente_logado['id']
-            resp = supabase.table('clientes').select('*').eq('id', c_id).execute()
-            if resp.data:
-                st.session_state.cliente_logado = resp.data[0]
-            else:
-                st.session_state.cliente_logado = None
-                st.rerun()
-        except:
-            pass 
-    
-    # --- TELA DE LOGIN / PRIMEIRO ACESSO ---
     if st.session_state.cliente_logado is None:
+        # --- LOGIN DO CLIENTE (Mantido igual) ---
         col_esq, col_centro, col_dir = st.columns([1, 2, 1])
         with col_centro:
             st.markdown("<h2 style='text-align: center;'>Área do Cliente</h2>", unsafe_allow_html=True)
+            tab_login, tab_cadastro = st.tabs(["Já tenho conta", "Criar conta"])
             
-            # Abas ajustadas para a nova lógica
-            tab_login, tab_primeiro = st.tabs(["Já tenho senha", "Criar senha (1º Acesso)"])
-            
-            # ABA 1: LOGIN (CNPJ ou Telefone)
             with tab_login:
-                st.info("Entre com seu CNPJ ou Telefone cadastrado.")
                 with st.form("login_cliente"):
-                    # Campo unificado
-                    identificador = st.text_input("CNPJ ou Telefone (apenas números)")
+                    email = st.text_input("Email")
                     senha = st.text_input("Senha", type="password")
-                    
                     if st.form_submit_button("Entrar", use_container_width=True):
-                        if not identificador or not senha:
-                            st.warning("Preencha todos os campos")
+                        # Tenta login na tabela clientes
+                        resp = supabase.table('clientes').select('*').eq('email', email.strip()).execute()
+                        usuarios = resp.data if hasattr(resp, 'data') else []
+                        
+                        usuario_validado = None
+                        for u in usuarios:
+                            if bcrypt.checkpw(senha.encode('utf-8'), u['senha_hash'].encode('utf-8')):
+                                usuario_validado = u
+                                break
+                        
+                        if usuario_validado:
+                            st.session_state.cliente_logado = usuario_validado
+                            st.success(f"Bem-vindo, {usuario_validado['nome']}!")
+                            st.rerun()
                         else:
-                            # Busca inteligente (CNPJ ou Tel)
-                            cliente_encontrado, mensagem = autenticar_cliente(identificador, senha)
-                            
-                            if cliente_encontrado:
-                                st.session_state.cliente_logado = cliente_encontrado
-                                st.success(mensagem)
-                                st.rerun()
-                            else:
-                                st.error(mensagem)
-
-            # ABA 2: PRIMEIRO ACESSO (Ativar conta criada pelo Representante)
-            with tab_primeiro:
-                st.write("Se o representante já te cadastrou, defina sua senha aqui.")
-                with st.form("primeiro_acesso"):
-                    doc_busca = st.text_input("Informe seu CNPJ ou Telefone")
-                    nova_senha = st.text_input("Crie sua Senha", type="password")
-                    confirma_senha = st.text_input("Confirme a Senha", type="password")
+                            st.error("Email ou senha incorretos.")
+            
+            with tab_cadastro:
+                with st.form("cadastro_cliente"):
+                    novo_nome = st.text_input("Seu Nome / Razão Social")
+                    novo_email = st.text_input("Seu Email")
+                    nova_senha = st.text_input("Crie uma Senha", type="password")
+                    rep_codigo = st.text_input("Código do Representante (Email dele)")
                     
-                    if st.form_submit_button("Ativar Conta", use_container_width=True):
-                        if not doc_busca or not nova_senha:
-                            st.warning("Preencha os campos.")
-                        elif nova_senha != confirma_senha:
-                            st.error("As senhas não coincidem.")
+                    if st.form_submit_button("Cadastrar", use_container_width=True):
+                        if not novo_nome or not novo_email or not nova_senha or not rep_codigo:
+                            st.warning("Preencha todos os campos.")
                         else:
-                            # Localiza o cliente na base (que veio do Excel)
-                            cliente_base, _ = buscar_cliente_para_cadastro(doc_busca)
+                            # 1. Achar representante
+                            resp_rep = supabase.table('profiles').select('id').eq('email', rep_codigo.strip()).execute()
+                            dados_rep = resp_rep.data if hasattr(resp_rep, 'data') else []
                             
-                            if cliente_base:
-                                # Grava a senha no cliente existente
-                                sucesso, msg = criar_senha_cliente(cliente_base['id'], nova_senha)
-                                if sucesso:
-                                    st.success("✅ Senha criada! Agora faça login na aba ao lado.")
-                                else:
-                                    st.error(msg)
+                            if not dados_rep:
+                                st.error("Representante não encontrado. Verifique o email dele.")
                             else:
-                                st.error("❌ Cliente não encontrado. Verifique se o número está correto ou fale com seu representante.")
+                                rep_id = dados_rep[0]['id']
+                                # 2. Hash senha
+                                hashed = bcrypt.hashpw(nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                                try:
+                                    supabase.table('clientes').insert({
+                                        'nome': novo_nome,
+                                        'email': novo_email,
+                                        'senha_hash': hashed,
+                                        'representante_id': rep_id,
+                                        'visualiza_preco': True 
+                                    }).execute()
+                                    st.success("Cadastro realizado! Faça login.")
+                                except Exception as e:
+                                    st.error(f"Erro ao cadastrar: {e}")
         return
 
-    # --- ÁREA LOGADA (Mantida igual) ---
+    # --- AQUI ESTÁ A CORREÇÃO DE SEGURANÇA (O PULO DO GATO) ---
+    # Mesmo logado, vamos no banco conferir se ele AINDA tem permissão
+    try:
+        cliente_id_sessao = st.session_state.cliente_logado['id']
+        resp = supabase.table('clientes').select('*').eq('id', cliente_id_sessao).execute()
+        
+        if resp.data:
+            # Atualiza a sessão com o dado REAL do banco (incluindo visualiza_preco)
+            st.session_state.cliente_logado = resp.data[0]
+        else:
+            # Se o cliente não existe mais no banco, expulsa
+            st.session_state.cliente_logado = None
+            st.rerun()
+    except:
+        pass # Se der erro de conexão, segue com o que tem na memória
+    # ----------------------------------------------------------
+
+    # Cliente logado e atualizado
     cliente = st.session_state.cliente_logado
+    
     st.sidebar.title(f"Olá, {cliente.get('nome', 'Cliente')}!")
     
+    # Debug visual (só pra você saber se funcionou, pode tirar depois)
+    # st.sidebar.caption(f"Ver Preços: {'✅ Sim' if cliente.get('visualiza_preco') else '❌ Não'}")
+
     menu = st.sidebar.radio("Menu", ["Nova Cotação", "Meus Pedidos"])
     
     if st.sidebar.button("Sair"):
@@ -2262,6 +2339,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
