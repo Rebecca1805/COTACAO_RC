@@ -1,7 +1,7 @@
 """
 Módulo para gerenciar leitura, validação e sincronização de produtos
 com Supabase. Suporta CSV, XLS e XLSX com normalização de colunas.
-ATUALIZADO: Com proteção contra duplicatas e uso de UPSERT.
+ATUALIZADO: Com proteção contra duplicatas e uso de UPSERT para corrigir erros 23502 e 23505.
 """
 
 import pandas as pd
@@ -10,112 +10,64 @@ import re
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 import streamlit as st
-from datetime import datetime, timezone # Adicionado para garantir datas corretas
+from datetime import datetime, timezone
 
 # =====================================================================
 # CONFIGURAÇÕES E CONSTANTES
 # =====================================================================
 
-# Mapa de variações de nomes de colunas para padrão normalizado
 MAPA_COLUNAS = {
     # Código
-    'codigo_1': 'codigo',
-    'codigo_item': 'codigo',
-    'codigoitem': 'codigo',
-    'code': 'codigo',
-    'cod': 'codigo',
-    'item': 'codigo',
-    'sku': 'codigo',
-    'product_code': 'codigo',
-    'productcode': 'codigo',
+    'codigo_1': 'codigo', 'codigo_item': 'codigo', 'codigoitem': 'codigo',
+    'code': 'codigo', 'cod': 'codigo', 'item': 'codigo', 'sku': 'codigo',
+    'product_code': 'codigo', 'productcode': 'codigo',
     
     # Produto/Nome
-    'produto_1': 'produto',
-    'nome': 'produto',
-    'product': 'produto',
-    'descricao': 'produto',
-    'descricao_do_produto': 'produto',
-    'descricaodoproduto': 'produto',
-    'description': 'produto',
-    'item_name': 'produto',
-    'nome_do_produto': 'produto',
-    'nomedoproduto': 'produto',
+    'produto_1': 'produto', 'nome': 'produto', 'product': 'produto',
+    'descricao': 'produto', 'descricao_do_produto': 'produto',
+    'descricaodoproduto': 'produto', 'description': 'produto',
+    'item_name': 'produto', 'nome_do_produto': 'produto', 'nomedoproduto': 'produto',
     
     # Unidade
-    'unidade_1': 'unidade',
-    'unit': 'unidade',
-    'un': 'unidade',
-    'measurement': 'unidade',
+    'unidade_1': 'unidade', 'unit': 'unidade', 'un': 'unidade', 'measurement': 'unidade',
     
     # Preços - Retirada
-    'preco_retira_1': 'preco_retira',
-    'preco_retirada': 'preco_retira',
-    'precoretirada': 'preco_retira',
-    'price_pickup': 'preco_retira',
-    'pickup_price': 'preco_retira',
-    'retirada': 'preco_retira',
-    'varejo': 'preco_retira',
-    'preco_varejo': 'preco_retira',
-    'preco_unitario_retira': 'preco_retira',
-    'precounitarioretira': 'preco_retira',
-    'retira': 'preco_retira',
-    'balcao': 'preco_retira',
-    'loja': 'preco_retira',
+    'preco_retira_1': 'preco_retira', 'preco_retirada': 'preco_retira',
+    'precoretirada': 'preco_retira', 'price_pickup': 'preco_retira',
+    'pickup_price': 'preco_retira', 'retirada': 'preco_retira',
+    'varejo': 'preco_retira', 'preco_varejo': 'preco_retira',
+    'preco_unitario_retira': 'preco_retira', 'precounitarioretira': 'preco_retira',
+    'retira': 'preco_retira', 'balcao': 'preco_retira', 'loja': 'preco_retira',
     
-    # Preços - Entrega Geral (fallback para preco_entrega)
-    'preco_entrega_1': 'preco_entrega',
-    'preco_entrega': 'preco_entrega',
-    'precoentrega': 'preco_entrega',
-    'preco_delivery': 'preco_entrega',
-    'precodelivery': 'preco_entrega',
-    'price_delivery': 'preco_entrega',
-    'delivery_price': 'preco_entrega',
-    'atacado': 'preco_entrega',
-    'preco_atacado': 'preco_entrega',
-    'entrega': 'preco_entrega', 
-    'frete': 'preco_entrega',
-    'transporte': 'preco_entrega',
+    # Preços - Entrega Geral
+    'preco_entrega_1': 'preco_entrega', 'preco_entrega': 'preco_entrega',
+    'precoentrega': 'preco_entrega', 'preco_delivery': 'preco_entrega',
+    'precodelivery': 'preco_entrega', 'price_delivery': 'preco_entrega',
+    'delivery_price': 'preco_entrega', 'atacado': 'preco_entrega',
+    'preco_atacado': 'preco_entrega', 'entrega': 'preco_entrega', 
+    'frete': 'preco_entrega', 'transporte': 'preco_entrega',
     
-    # Preços por Distância (100-199km)
-    'preco_100a199km': 'preco_100a199km',
-    'preco100a199km': 'preco_100a199km',
-    'preco_100_199': 'preco_100a199km',
-    'price_100_199': 'preco_100a199km',
+    # Preços por Distância
+    'preco_100a199km': 'preco_100a199km', 'preco100a199km': 'preco_100a199km',
+    'preco_100_199': 'preco_100a199km', 'price_100_199': 'preco_100a199km',
     
-    # Preços por Distância (200-299km)
-    'preco_200a299km': 'preco_200a299km',
-    'preco200a299km': 'preco_200a299km',
-    'preco_200_299': 'preco_200a299km',
-    'price_200_299': 'preco_200a299km',
+    'preco_200a299km': 'preco_200a299km', 'preco200a299km': 'preco_200a299km',
+    'preco_200_299': 'preco_200a299km', 'price_200_299': 'preco_200a299km',
     
-    # Preços por Distância (300-399km)
-    'preco_300a399km': 'preco_300a399km',
-    'preco300a399km': 'preco_300a399km',
-    'preco_300_399': 'preco_300a399km',
-    'price_300_399': 'preco_300a399km',
+    'preco_300a399km': 'preco_300a399km', 'preco300a399km': 'preco_300a399km',
+    'preco_300_399': 'preco_300a399km', 'price_300_399': 'preco_300a399km',
     
-    # Preços por Distância (acima 400km)
-    'preco_acima400km': 'preco_acima400km',
-    'precoac400km': 'preco_acima400km',
-    'preco_400': 'preco_acima400km',
-    'price_400': 'preco_acima400km',
+    'preco_acima400km': 'preco_acima400km', 'precoac400km': 'preco_acima400km',
+    'preco_400': 'preco_acima400km', 'price_400': 'preco_acima400km',
     
-    # Preços por Distância (acima 500km)
-    'preco_acima500km': 'preco_acima500km',
-    'precoac500km': 'preco_acima500km',
-    'preco_500': 'preco_acima500km',
-    'price_500': 'preco_acima500km',
+    'preco_acima500km': 'preco_acima500km', 'precoac500km': 'preco_acima500km',
+    'preco_500': 'preco_acima500km', 'price_500': 'preco_acima500km',
     
-    # Preços por Distância (acima 600km)
-    'preco_acima600km': 'preco_acima600km',
-    'precoac600km': 'preco_acima600km',
-    'preco_600': 'preco_acima600km',
-    'price_600': 'preco_acima600km',
+    'preco_acima600km': 'preco_acima600km', 'precoac600km': 'preco_acima600km',
+    'preco_600': 'preco_acima600km', 'price_600': 'preco_acima600km',
     
     # Variações de preço geral (fallback)
-    'preco': 'preco_padrao',
-    'price': 'preco_padrao',
-    'valor': 'preco_padrao',
+    'preco': 'preco_padrao', 'price': 'preco_padrao', 'valor': 'preco_padrao',
 }
 
 COLUNAS_OBRIGATORIAS = ['codigo', 'produto']
@@ -154,7 +106,8 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
                 raise ValueError(f"Erro ao ler CSV. Detalhe: {erro_detalhado}")
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
             tentativas_excel = [
-                {'sheet_name': 0}, {'sheet_name': 'produtos'}, {'sheet_name': 'Produtos'}, {'sheet_name': 'Sheet1'}
+                {'sheet_name': 0}, {'sheet_name': 'produtos'}, 
+                {'sheet_name': 'Produtos'}, {'sheet_name': 'Sheet1'}
             ]
             for tentativa in tentativas_excel:
                 try:
@@ -352,7 +305,7 @@ def sincronizar_produtos_supabase(
                 sucesso += len(lote)
             except Exception as e:
                 erro_msg = str(e)
-                print(f"Erro Lote {i}: {erro_msg}")
+                # print(f"Erro Lote {i}: {erro_msg}")
                 st.error(f"Erro no lote {i//TAMANHO_LOTE + 1}: {erro_msg}")
                 # Continua tentando os próximos lotes
             
@@ -372,157 +325,7 @@ def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
         col1.metric("Linhas", len(df))
         col2.metric("Colunas", len(df.columns))
     st.dataframe(df.head(max_linhas), use_container_width=True)
-        
-        # 5. Adicionar timestamp se não tiver
-        if 'updated_at' not in df.columns:
-            df['updated_at'] = pd.Timestamp.now().isoformat()
-        
-        st.success(f"✅ Arquivo processado com sucesso! {len(df)} produtos carregados.")
-        
-        return df
-        
-    except Exception as e:
-        st.error(f"❌ Erro ao processar arquivo: {str(e)}")
-        return None
 
-
-# =====================================================================
-# FUNÇÕES DE SINCRONIZAÇÃO COM SUPABASE
-# =====================================================================
-
-def sincronizar_produtos_supabase(
-    supabase_client,
-    df: pd.DataFrame,
-    tabela: str = 'produtos',
-    limpar_antes: bool = True,
-    representante_id: str = None
-) -> Tuple[bool, str]:
-    """
-    Sincroniza produtos com Supabase:
-    1. (Opcional) Limpa tabela antiga
-    2. Insere novos produtos com múltiplos preços por distância
-    3. Retorna (sucesso: bool, mensagem: str)
-    """
-    try:
-        # 1. Limpar dados antigos (opcional)
-        if limpar_antes:
-            try:
-                if representante_id:
-                    # Limpa só os produtos deste representante
-                    supabase_client.table(tabela).delete().eq(
-                        'representante_id', representante_id
-                    ).execute()
-                    st.info(f"🗑️ Produtos anteriores do representante deletados")
-                else:
-                    # Limpa tudo (cuidado!)
-                    supabase_client.table(tabela).delete().neq(
-                        'id', 'non-existent'
-                    ).execute()
-                    st.info("🗑️ Tabela de produtos limpa")
-            except Exception as e:
-                st.warning(f"⚠️ Não foi possível limpar tabela anterior: {e}")
-        
-        # 2. Preparar dados para inserção
-        records = []
-        colunas_preco_distancia = [
-            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
-            'preco_acima400km', 'preco_acima500km', 'preco_acima600km'
-        ]
-
-        # --- PROTEÇÃO: LISTA DE COLUNAS PERMITIDAS NO BANCO ---
-        # Isso evita o erro PGRST204 se o Excel tiver colunas extras
-        colunas_permitidas = [
-            'representante_id', 'codigo', 'produto', 'unidade',
-            'preco_retira', 'preco_entrega', 
-            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
-            'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
-            'created_at', 'updated_at'
-        ]
-        
-        for idx, row in df.iterrows():
-            record = {
-                'codigo': str(row.get('codigo', '')).strip(),
-                'produto': str(row.get('produto', '')).strip(),
-                'unidade': str(row.get('unidade', 'UN')).strip() or 'UN',
-                'preco_retira': float(row.get('preco_retira', 0)) or 0.0,
-                'preco_entrega': float(row.get('preco_entrega', 0)) or 0.0,
-                'updated_at': row.get('updated_at', pd.Timestamp.now().isoformat()),
-            }
-            
-            # Adiciona preços por distância se existirem
-            for col_dist in colunas_preco_distancia:
-                if col_dist in df.columns:
-                    valor = row.get(col_dist, 0)
-                    record[col_dist] = float(valor) if pd.notna(valor) else 0.0
-            
-            # Adiciona representante se fornecido
-            if representante_id:
-                record['representante_id'] = representante_id
-            
-            # Adiciona outras colunas APENAS SE existirem no banco
-            for col in df.columns:
-                if col not in record and col in colunas_permitidas:
-                    try:
-                        val = row[col]
-                        # Converte NaN para None (null no SQL)
-                        if pd.isna(val):
-                            val = None
-                        record[col] = val
-                    except:
-                        pass
-            
-            records.append(record)
-        
-        # 3. Inserir em lotes (melhor performance)
-        tamanho_lote = 100
-        total_inseridos = 0
-        
-        for i in range(0, len(records), tamanho_lote):
-            lote = records[i:i+tamanho_lote]
-            try:
-                resultado = supabase_client.table(tabela).insert(lote).execute()
-                total_inseridos += len(lote)
-            except Exception as e:
-                # Mostra o erro exato mas não trava tudo imediatamente, tenta mostrar log
-                erro_msg = str(e)
-                st.error(f"❌ Erro ao inserir lote {i//tamanho_lote + 1}: {erro_msg}")
-                print(f"DEBUG ERRO LOTE: {lote[0] if lote else 'Vazio'}") # Ajuda a debugar
-                return False, f"Falha ao inserir produtos: {erro_msg}"
-        
-        mensagem = f"✅ {total_inseridos} produtos sincronizados com sucesso!"
-        return True, mensagem
-        
-    except Exception as e:
-        return False, f"❌ Erro na sincronização: {str(e)}"
-
-
-# =====================================================================
-# FUNÇÕES AUXILIARES DE VISUALIZAÇÃO
-# =====================================================================
-
-def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
-    """Exibe preview dos dados carregados"""
-    st.subheader("📋 Preview dos Dados")
-    
-    with st.expander("Ver estrutura dos dados", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total de Linhas", len(df))
-        with col2:
-            st.metric("Total de Colunas", len(df.columns))
-        with col3:
-            st.metric("Tamanho (MB)", f"{df.memory_usage(deep=True).sum() / 1024**2:.2f}")
-        
-        st.write("**Colunas encontradas:**")
-        cols_info = []
-        for col in df.columns:
-            dtype = df[col].dtype
-            nulos = df[col].isna().sum()
-            cols_info.append(f"- `{col}` ({dtype}) - {nulos} nulos")
-        st.write('\n'.join(cols_info))
-    
-    st.write("**Primeiras linhas:**")
-    st.dataframe(df.head(max_linhas), use_container_width=True)
 
 
 
