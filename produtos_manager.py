@@ -1,13 +1,16 @@
 """
 Módulo para gerenciar leitura, validação e sincronização de produtos
-com Supabase. Suporta CSV, XLS e XLSX com normalização de colunas.
-ATUALIZADO: Com proteção contra duplicatas e uso de UPSERT para corrigir erros 23502 e 23505.
+com Supabase.
+ATUALIZADO:
+- Limpeza rigorosa (substituição de tabela).
+- Preservação apenas de histórico consolidado (Aprovadas/Canceladas).
+- Recálculo automático de cotações PENDENTES.
 """
 
 import pandas as pd
 import numpy as np
 import re
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Tuple, List
 from pathlib import Path
 import streamlit as st
 from datetime import datetime, timezone
@@ -20,311 +23,351 @@ MAPA_COLUNAS = {
     # Código
     'codigo_1': 'codigo', 'codigo_item': 'codigo', 'codigoitem': 'codigo',
     'code': 'codigo', 'cod': 'codigo', 'item': 'codigo', 'sku': 'codigo',
-    'product_code': 'codigo', 'productcode': 'codigo',
     
-    # Produto/Nome
+    # Produto
     'produto_1': 'produto', 'nome': 'produto', 'product': 'produto',
-    'descricao': 'produto', 'descricao_do_produto': 'produto',
-    'descricaodoproduto': 'produto', 'description': 'produto',
-    'item_name': 'produto', 'nome_do_produto': 'produto', 'nomedoproduto': 'produto',
+    'descricao': 'produto', 'description': 'produto', 'descricaodoproduto': 'produto',
     
     # Unidade
-    'unidade_1': 'unidade', 'unit': 'unidade', 'un': 'unidade', 'measurement': 'unidade',
+    'unidade_1': 'unidade', 'unit': 'unidade', 'un': 'unidade',
     
     # Preços - Retirada
     'preco_retira_1': 'preco_retira', 'preco_retirada': 'preco_retira',
-    'precoretirada': 'preco_retira', 'price_pickup': 'preco_retira',
-    'pickup_price': 'preco_retira', 'retirada': 'preco_retira',
-    'varejo': 'preco_retira', 'preco_varejo': 'preco_retira',
-    'preco_unitario_retira': 'preco_retira', 'precounitarioretira': 'preco_retira',
+    'precoretirada': 'preco_retira', 'retirada': 'preco_retira',
     'retira': 'preco_retira', 'balcao': 'preco_retira', 'loja': 'preco_retira',
     
-    # Preços - Entrega Geral
+    # Preços - Entrega (Mapeamento padrão e distâncias)
     'preco_entrega_1': 'preco_entrega', 'preco_entrega': 'preco_entrega',
-    'precoentrega': 'preco_entrega', 'preco_delivery': 'preco_entrega',
-    'precodelivery': 'preco_entrega', 'price_delivery': 'preco_entrega',
-    'delivery_price': 'preco_entrega', 'atacado': 'preco_entrega',
-    'preco_atacado': 'preco_entrega', 'entrega': 'preco_entrega', 
-    'frete': 'preco_entrega', 'transporte': 'preco_entrega',
+    'precoentrega': 'preco_entrega', 'entrega': 'preco_entrega',
     
-    # Preços por Distância
     'preco_100a199km': 'preco_100a199km', 'preco100a199km': 'preco_100a199km',
-    'preco_100_199': 'preco_100a199km', 'price_100_199': 'preco_100a199km',
-    
     'preco_200a299km': 'preco_200a299km', 'preco200a299km': 'preco_200a299km',
-    'preco_200_299': 'preco_200a299km', 'price_200_299': 'preco_200a299km',
-    
     'preco_300a399km': 'preco_300a399km', 'preco300a399km': 'preco_300a399km',
-    'preco_300_399': 'preco_300a399km', 'price_300_399': 'preco_300a399km',
-    
     'preco_acima400km': 'preco_acima400km', 'precoac400km': 'preco_acima400km',
-    'preco_400': 'preco_acima400km', 'price_400': 'preco_acima400km',
-    
     'preco_acima500km': 'preco_acima500km', 'precoac500km': 'preco_acima500km',
-    'preco_500': 'preco_acima500km', 'price_500': 'preco_acima500km',
-    
     'preco_acima600km': 'preco_acima600km', 'precoac600km': 'preco_acima600km',
-    'preco_600': 'preco_acima600km', 'price_600': 'preco_acima600km',
-    
-    # Variações de preço geral (fallback)
-    'preco': 'preco_padrao', 'price': 'preco_padrao', 'valor': 'preco_padrao',
 }
 
 COLUNAS_OBRIGATORIAS = ['codigo', 'produto']
-COLUNAS_RECOMENDADAS = ['codigo', 'produto', 'unidade', 'retira', 'entrega']
-EXTENSOES_SUPORTADAS = ['.csv', '.xls', '.xlsx']
-
 
 # =====================================================================
 # FUNÇÕES DE LEITURA E PARSING
 # =====================================================================
 
 def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
-    """Lê arquivo CSV ou Excel com múltiplas estratégias."""
     try:
         nome_arquivo = arquivo.name.lower()
         if nome_arquivo.endswith('.csv'):
+            # Tenta diferentes configurações de CSV
             tentativas = [
                 {'sep': ',', 'encoding': 'utf-8', 'decimal': '.'},
                 {'sep': ',', 'encoding': 'latin1', 'decimal': ','},
                 {'sep': ';', 'encoding': 'utf-8', 'decimal': ','},
                 {'sep': ';', 'encoding': 'latin1', 'decimal': ','},
-                {'sep': '\t', 'encoding': 'utf-8', 'decimal': '.'},
             ]
-            df = None
-            erro_detalhado = None
-            for tentativa in tentativas:
+            for tent in tentativas:
                 try:
                     arquivo.seek(0)
-                    df = pd.read_csv(arquivo, **tentativa)
-                    if not df.empty and len(df.columns) > 1:
-                        return df
-                except Exception as e:
-                    erro_detalhado = str(e)
-                    continue
-            if df is None:
-                raise ValueError(f"Erro ao ler CSV. Detalhe: {erro_detalhado}")
+                    df = pd.read_csv(arquivo, **tent)
+                    if len(df.columns) > 1: return df
+                except: continue
+            raise ValueError("Não foi possível ler o CSV.")
+            
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
-            tentativas_excel = [
-                {'sheet_name': 0}, {'sheet_name': 'produtos'}, 
-                {'sheet_name': 'Produtos'}, {'sheet_name': 'Sheet1'}
-            ]
-            for tentativa in tentativas_excel:
-                try:
-                    arquivo.seek(0)
-                    df = pd.read_excel(arquivo, **tentativa)
-                    if not df.empty:
-                        return df
-                except Exception:
-                    continue
-            raise ValueError("Erro ao ler Excel.")
-        else:
-            raise ValueError(f"Formato {Path(nome_arquivo).suffix} não suportado.")
+            return pd.read_excel(arquivo)
     except Exception as e:
-        raise Exception(f"Erro na leitura: {str(e)}")
-
+        st.error(f"Erro ao ler arquivo: {e}")
+        return None
 
 def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    """Padroniza nomes das colunas."""
-    def limpar_coluna(col: str) -> str:
-        col = str(col).strip().lower()
-        col = re.sub(r'[àáâãäå]', 'a', col)
-        col = re.sub(r'[èéêë]', 'e', col)
-        col = re.sub(r'[ìíîï]', 'i', col)
-        col = re.sub(r'[òóôõö]', 'o', col)
-        col = re.sub(r'[ùúûü]', 'u', col)
-        col = re.sub(r'[ç]', 'c', col)
-        col = re.sub(r'[^a-z0-9_]', '', col)
-        col = re.sub(r'_+', '_', col)
-        return col.strip('_')
+    def limpar(col):
+        c = str(col).strip().lower()
+        c = re.sub(r'[^a-z0-9_]', '', c) # Remove caracteres especiais
+        return c
     
-    df.columns = [limpar_coluna(col) for col in df.columns]
+    # 1. Limpeza básica
+    df.columns = [limpar(c) for c in df.columns]
+    # 2. Rename usando o mapa
     df = df.rename(columns=MAPA_COLUNAS)
     return df
 
-
 def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    """Valida estrutura mínima."""
-    mensagens = []
-    faltando = [col for col in COLUNAS_OBRIGATORIAS if col not in df.columns]
-    if faltando:
-        mensagens.append(f"❌ Colunas obrigatórias faltando: {', '.join(faltando)}")
-    if df.empty:
-        mensagens.append("❌ Arquivo vazio.")
-    
-    validacoes = {'codigo': lambda x: str(x).strip() != '', 'produto': lambda x: str(x).strip() != ''}
-    for col, val in validacoes.items():
-        if col in df.columns:
-            if not df[df[col].apply(val)].shape[0] == df.shape[0]:
-                mensagens.append(f"⚠️ Existem linhas com {col} vazio.")
-                
-    return len([m for m in mensagens if m.startswith('❌')]) == 0, mensagens
-
+    msgs = []
+    faltando = [c for c in COLUNAS_OBRIGATORIAS if c not in df.columns]
+    if faltando: msgs.append(f"❌ Faltando colunas: {faltando}")
+    return len(faltando) == 0, msgs
 
 def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limpa dados e garante UNICIDADE DO CÓDIGO para evitar erros de banco.
-    """
-    df = df.dropna(how='all').reset_index(drop=True)
+    # Remove linhas vazias
+    df = df.dropna(how='all')
     
-    # 1. FORÇA O CÓDIGO PARA STRING AGORA (Vital para evitar duplicatas mistas)
+    # Garante código como string e remove vazios
     if 'codigo' in df.columns:
-        # Converte tudo para string e remove espaços
-        df['codigo'] = df['codigo'].apply(lambda x: str(x).strip() if pd.notna(x) else "")
-        # Remove vazios
-        df = df[df['codigo'] != ""]
-        
-        # Remove duplicatas exatas de código
-        tamanho_antes = len(df)
-        df = df.drop_duplicates(subset=['codigo'], keep='first')
-        
-        if len(df) < tamanho_antes:
-            st.warning(f"⚠️ {tamanho_antes - len(df)} códigos duplicados foram removidos da planilha.")
+        df['codigo'] = df['codigo'].astype(str).str.strip()
+        df = df[df['codigo'] != '']
+        # Remove duplicatas de código no arquivo (mantém o último ou primeiro)
+        df = df.drop_duplicates(subset=['codigo'], keep='last')
 
-    # 2. Limpa textos gerais
-    for col in df.select_dtypes(include=['object']).columns:
-        if col != 'codigo': 
-            df[col] = df[col].apply(lambda x: str(x).strip() if pd.notna(x) else x)
-    
-    # 3. Limpa preços
-    for col in df.columns:
-        if any(p in col.lower() for p in ['preco', 'retira', 'entrega', 'price', 'value']):
-            df[col] = df[col].apply(converter_preco)
-            
+    # Trata preços
+    cols_preco = [c for c in df.columns if 'preco' in c]
+    for c in cols_preco:
+        df[c] = df[c].apply(converter_preco)
+        
     return df
 
-
-def converter_preco(valor) -> float:
-    """Converte strings financeiras para float."""
-    if valor is None or (isinstance(valor, float) and np.isnan(valor)): return 0.0
-    if isinstance(valor, (int, float)): return float(valor)
-    texto = str(valor).replace('R$', '').replace(' ', '').strip()
-    if not texto or texto in ['-', 'n/a']: return 0.0
-    
-    if ',' in texto and '.' in texto:
-        if texto.rindex(',') > texto.rindex('.'): texto = texto.replace('.', '').replace(',', '.') # BR
-        else: texto = texto.replace(',', '') # US
-    elif ',' in texto: texto = texto.replace(',', '.') # BR simples
-    
-    try: return float(texto)
+def converter_preco(val):
+    if pd.isna(val): return 0.0
+    if isinstance(val, (int, float)): return float(val)
+    s = str(val).replace('R$', '').replace(' ', '').strip()
+    if ',' in s and '.' in s: s = s.replace('.', '').replace(',', '.')
+    elif ',' in s: s = s.replace(',', '.')
+    try: return float(s)
     except: return 0.0
 
-
-def processar_arquivo_produtos(arquivo) -> Optional[pd.DataFrame]:
-    """Pipeline completo de processamento."""
-    try:
-        df = ler_arquivo(arquivo)
-        df = normalizar_colunas(df)
-        valido, msgs = validar_dados(df)
-        for msg in msgs:
-            if msg.startswith('❌'): st.error(msg)
-            else: st.warning(msg)
-        
-        if not valido: return None
-        
-        df = limpar_dados(df)
-        
-        if 'updated_at' not in df.columns:
-            df['updated_at'] = datetime.now(timezone.utc).isoformat()
-            
-        st.success(f"✅ Arquivo processado: {len(df)} produtos prontos.")
-        return df
-    except Exception as e:
-        st.error(f"❌ Erro ao processar: {str(e)}")
+def processar_arquivo_produtos(arquivo):
+    df = ler_arquivo(arquivo)
+    if df is None: return None
+    
+    df = normalizar_colunas(df)
+    valido, msgs = validar_dados(df)
+    
+    if not valido:
+        for m in msgs: st.error(m)
         return None
-
+        
+    return limpar_dados(df)
 
 # =====================================================================
-# FUNÇÕES DE SINCRONIZAÇÃO COM SUPABASE (CORRIGIDA)
+# SINCRONIZAÇÃO E RECÁLCULO (LÓGICA NOVA)
 # =====================================================================
 
-def sincronizar_produtos_supabase(
-    supabase_client,
-    df: pd.DataFrame,
-    tabela: str = 'produtos',
-    limpar_antes: bool = False, # Mudado padrão para False para segurança
-    representante_id: str = None
-) -> Tuple[bool, str]:
+def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=False, representante_id=None):
     """
-    Sincroniza produtos usando UPSERT (Atualização inteligente).
-    Resolve erros de chave duplicada e violação de chave estrangeira.
+    1. Atualiza/Insere produtos novos (Upsert).
+    2. Remove produtos antigos que NÃO estão no arquivo, EXCETO se estiverem em cotações APROVADA/CANCELADA.
+    3. Chama a função para atualizar preços das cotações PENDENTES.
     """
     try:
-        # ATENÇÃO: Ignoramos 'limpar_antes' aqui propositalmente para evitar 
-        # o erro de chave estrangeira (FK Constraint) se houver cotações ativas.
-        # Em vez de apagar, vamos apenas atualizar (Upsert).
+        if not representante_id: return False, "ID do representante não fornecido."
         
-        # Garante ID do representante
-        if representante_id:
-            df['representante_id'] = representante_id
-        
-        # Atualiza timestamp
+        df['representante_id'] = representante_id
         df['updated_at'] = datetime.now(timezone.utc).isoformat()
-
-        # Prepara colunas permitidas (Evita erro se Excel tiver sujeira)
-        colunas_db = [
-            'representante_id', 'codigo', 'produto', 'unidade',
-            'preco_retira', 'preco_entrega', 
-            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
-            'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
-            'updated_at'
-        ]
         
-        # Converte para lista de dicionários limpos
-        records = []
-        for _, row in df.iterrows():
-            item = {}
-            for col in colunas_db:
-                if col in df.columns:
-                    val = row[col]
-                    # Trata NaN/NaT
-                    if pd.isna(val) or val == "":
-                        val = None
-                    item[col] = val
-            records.append(item)
-            
-        if not records:
-            return True, "Nenhum dado para importar."
-
-        # Processamento em Lotes com UPSERT
-        TAMANHO_LOTE = 100
-        sucesso = 0
-        barra = st.progress(0)
+        # ---------------------------------------------------------
+        # 1. UPSERT (Atualiza a base com a tabela nova)
+        # ---------------------------------------------------------
+        records = df.to_dict('records')
         
-        for i in range(0, len(records), TAMANHO_LOTE):
-            lote = records[i:i+TAMANHO_LOTE]
-            try:
-                # --- A MÁGICA: UPSERT ---
-                # on_conflict='representante_id, codigo' diz ao banco:
-                # "Se essa combinação já existir, atualize os outros campos. Se não, crie novo."
-                supabase_client.table(tabela).upsert(
-                    lote, 
-                    on_conflict='representante_id, codigo'
-                ).execute()
+        # Trata valores NaN para None (JSON null)
+        for r in records:
+            for k, v in r.items():
+                if pd.isna(v): r[k] = None
                 
-                sucesso += len(lote)
-            except Exception as e:
-                erro_msg = str(e)
-                # print(f"Erro Lote {i}: {erro_msg}")
-                st.error(f"Erro no lote {i//TAMANHO_LOTE + 1}: {erro_msg}")
-                # Continua tentando os próximos lotes
+        # Envia em lotes
+        batch_size = 100
+        progresso = st.progress(0, text="Atualizando catálogo...")
+        
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i+batch_size]
+            supabase.table(tabela).upsert(batch, on_conflict='representante_id, codigo').execute()
+            progresso.progress(min((i+batch_size)/len(records), 0.8))
             
-            barra.progress(min((i + TAMANHO_LOTE) / len(records), 1.0))
+        # ---------------------------------------------------------
+        # 2. LIMPEZA (Substituição Inteligente)
+        # ---------------------------------------------------------
+        # Queremos apagar tudo que NÃO está no arquivo novo,
+        # MAS preservar o que é usado em histórico (Aprovada/Cancelada).
+        
+        codigos_novos = set(df['codigo'].astype(str).tolist())
+        
+        # Busca todos os produtos do banco
+        all_prods = supabase.table(tabela).select('id, codigo').eq('representante_id', representante_id).execute().data
+        
+        # Identifica quem sumiu do arquivo
+        ids_candidatos_exclusao = [p['id'] for p in all_prods if str(p['codigo']) not in codigos_novos]
+        
+        qtd_removidos = 0
+        qtd_preservados = 0
+        
+        if ids_candidatos_exclusao:
+            progresso.progress(0.85, text="Verificando integridade do histórico...")
             
-        return True, f"✅ Sincronização concluída! {sucesso} produtos atualizados/criados."
+            # Verifica quais desses IDs são usados em cotações "protegidas" (Aprovada/Cancelada)
+            # Para isso, precisamos fazer um join ou duas queries. Vamos por queries.
+            
+            # Passo A: Busca IDs de cotações que NÃO são pendentes
+            cot_protegidas = supabase.table('cotacoes')\
+                .select('id')\
+                .neq('status', 'PENDENTE')\
+                .eq('representante_id', representante_id)\
+                .execute().data
+            
+            ids_cot_protegidas = [c['id'] for c in cot_protegidas]
+            
+            ids_produtos_protegidos = set()
+            
+            if ids_cot_protegidas:
+                # Passo B: Busca itens dessas cotações que contêm os produtos candidatos
+                # Fazemos em lotes para não estourar a URL
+                for i in range(0, len(ids_candidatos_exclusao), 100):
+                    lote_prod = ids_candidatos_exclusao[i:i+100]
+                    
+                    # Se o produto está num item de cotação protegida
+                    resp = supabase.table('cotacao_itens')\
+                        .select('produto_id')\
+                        .in_('produto_id', lote_prod)\
+                        .in_('cotacao_id', ids_cot_protegidas)\
+                        .execute()
+                    
+                    for item in resp.data:
+                        ids_produtos_protegidos.add(item['produto_id'])
+            
+            # Passo C: Define quem roda (Quem sumiu do arquivo E NÃO é protegido)
+            # Obs: Se o produto estava só em PENDENTE, ele será apagado (e a cotação pendente perde o item, o que é correto)
+            ids_final_delete = [id_ for id_ in ids_candidatos_exclusao if id_ not in ids_produtos_protegidos]
+            qtd_preservados = len(ids_produtos_protegidos)
+            
+            # Passo D: Deleta
+            if ids_final_delete:
+                for i in range(0, len(ids_final_delete), 100):
+                    lote_del = ids_final_delete[i:i+100]
+                    supabase.table(tabela).delete().in_('id', lote_del).execute()
+                qtd_removidos = len(ids_final_delete)
+
+        # ---------------------------------------------------------
+        # 3. RECÁLCULO DE COTAÇÕES PENDENTES
+        # ---------------------------------------------------------
+        progresso.progress(0.9, text="Atualizando preços das cotações pendentes...")
+        qtd_cotacoes_atualizadas = recalcular_cotacoes_pendentes(supabase, representante_id)
+        
+        progresso.empty()
+        
+        msg = f"✅ Sucesso! {len(records)} produtos ativos."
+        if qtd_removidos > 0: msg += f" 🗑️ {qtd_removidos} fora de linha removidos."
+        if qtd_preservados > 0: msg += f" 🛡️ {qtd_preservados} antigos mantidos por histórico."
+        if qtd_cotacoes_atualizadas > 0: msg += f" 🔄 {qtd_cotacoes_atualizadas} cotações pendentes atualizadas."
+        
+        return True, msg
 
     except Exception as e:
-        return False, f"❌ Erro crítico na sincronização: {str(e)}"
+        return False, f"Erro crítico: {e}"
 
 
-def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
-    """Exibe preview dos dados carregados"""
-    st.subheader("📋 Preview dos Dados")
-    with st.expander("Ver estrutura", expanded=False):
-        col1, col2 = st.columns(2)
-        col1.metric("Linhas", len(df))
-        col2.metric("Colunas", len(df.columns))
-    st.dataframe(df.head(max_linhas), use_container_width=True)
+def recalcular_cotacoes_pendentes(supabase, representante_id):
+    """
+    Atualiza os preços dos itens em cotações PENDENTES com base na nova tabela.
+    Respeita a regra: Retira vs Entrega (Cliente).
+    """
+    try:
+        # 1. Buscar cotações pendentes + dados do cliente (para saber a coluna de preço)
+        # O Supabase permite select com join: cotacoes(..., clientes(coluna_preco))
+        resp = supabase.table('cotacoes')\
+            .select('id, forma_recebimento, clientes(coluna_preco)')\
+            .eq('representante_id', representante_id)\
+            .eq('status', 'PENDENTE')\
+            .execute()
+        
+        cotacoes_pendentes = resp.data
+        if not cotacoes_pendentes:
+            return 0
+        
+        # 2. Carregar TODOS os produtos atuais do representante (para consulta rápida de preço)
+        # Criamos um dicionário {codigo: {dados_do_produto}}
+        prods_resp = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
+        mapa_produtos = {p['codigo']: p for p in prods_resp.data} # Mapeia pelo código
+        
+        count_atualizadas = 0
+        
+        for cot in cotacoes_pendentes:
+            cot_id = cot['id']
+            forma_recebimento = cot.get('forma_recebimento')
+            
+            # Determina a coluna de preço a usar
+            cliente_data = cot.get('clientes') or {}
+            coluna_cliente = cliente_data.get('coluna_preco') or 'preco_entrega'
+            
+            if forma_recebimento == 'Retirada no centro de distribuição':
+                coluna_preco_target = 'preco_retira'
+            else:
+                coluna_preco_target = coluna_cliente
+            
+            # 3. Buscar itens da cotação
+            itens_resp = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cot_id).execute()
+            itens = itens_resp.data
+            
+            total_original_novo = 0.0
+            teve_alteracao = False
+            
+            for item in itens:
+                cod_prod = item['codigo']
+                
+                # Verifica se o produto ainda existe na tabela nova
+                if cod_prod in mapa_produtos:
+                    prod_novo = mapa_produtos[cod_prod]
+                    
+                    # Pega o novo preço base
+                    novo_preco_base = float(prod_novo.get(coluna_preco_target) or 0.0)
+                    
+                    # Se o preço mudou, atualiza
+                    # Nota: Mantemos o desconto_percentual que já estava no item
+                    preco_antigo = float(item.get('preco_unitario') or 0.0)
+                    
+                    # Atualizamos sempre para garantir, ou checamos if novo_preco_base != preco_antigo
+                    # Vamos atualizar sempre para garantir sincronia
+                    
+                    qtd = float(item['quantidade'])
+                    desconto = float(item.get('desconto_percentual') or 0.0)
+                    
+                    novo_subtotal = (novo_preco_base * qtd) * (1 - desconto/100)
+                    
+                    # Atualiza o item no banco
+                    supabase.table('cotacao_itens').update({
+                        'preco_unitario': novo_preco_base,
+                        'subtotal': novo_subtotal,
+                        # Opcional: atualizar nome/unidade se mudou
+                        'produto': prod_novo.get('produto'),
+                        'unidade': prod_novo.get('unidade')
+                    }).eq('id', item['id']).execute()
+                    
+                    total_original_novo += novo_subtotal
+                    teve_alteracao = True
+                else:
+                    # PRODUTO NÃO EXISTE MAIS?
+                    # Como é cotação PENDENTE e estamos "substituindo" a tabela, 
+                    # tecnicamente deveríamos remover o item ou alertar.
+                    # Por segurança do código, mantemos o valor antigo no somatório ou removemos.
+                    # Opção escolhida: Manter como está (item órfão) para não reduzir o valor bruscamente sem aviso,
+                    # mas idealmente o representante deve revisar.
+                    total_original_novo += float(item['subtotal'])
+            
+            # 4. Atualizar o total da cotação
+            if teve_alteracao:
+                # Recalcula total final com desconto geral da cotação
+                # Precisamos pegar o desconto geral atual da cotação. 
+                # (Não veio no select inicial, mas podemos pegar ou assumir que o update lida com isso)
+                # Vamos fazer um fetch rápido para garantir
+                cot_full = supabase.table('cotacoes').select('desconto_geral_percentual').eq('id', cot_id).single().execute()
+                desc_geral = float(cot_full.data.get('desconto_geral_percentual') or 0.0)
+                
+                novo_total_final = total_original_novo * (1 - desc_geral/100)
+                
+                supabase.table('cotacoes').update({
+                    'total_original': total_original_novo,
+                    'total_final': novo_total_final
+                }).eq('id', cot_id).execute()
+                
+                count_atualizadas += 1
+                
+        return count_atualizadas
+
+    except Exception as e:
+        print(f"Erro ao recalcular pendentes: {e}")
+        return 0
+
+def exibir_preview_dados(df: pd.DataFrame):
+    st.write(f"Linhas: {len(df)} | Colunas: {len(df.columns)}")
+    st.dataframe(df.head())
+
 
 
 
