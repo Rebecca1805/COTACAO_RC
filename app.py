@@ -1815,7 +1815,7 @@ def pagina_nova_cotacao(cliente):
 
     # Forma de recebimento - cliente escolhe apenas Retirada ou Entrega
     # A coluna de preço é automaticamente definida pela distância cadastrada
-    coluna_preco_cliente = cliente.get("colunapreco") or "precoentrega"
+    coluna_preco_cliente = cliente.get("colunapreco") or "preco_entrega"
     
     # DEBUG TEMPORÁRIO - remova depois de testar
     st.caption(f"🔍 Debug: Coluna de preço do cliente = {coluna_preco_cliente}")
@@ -2289,6 +2289,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
