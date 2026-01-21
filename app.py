@@ -1813,19 +1813,21 @@ def pagina_nova_cotacao(cliente):
         st.success(st.session_state["msg_sucesso"])
         del st.session_state["msg_sucesso"] # Remove para não aparecer de novo
 
-    # Forma de recebimento com opções de distância
-    opcoes_distancia = obter_opcoes_distancia()
-    labels_distancia = [label for label, _ in opcoes_distancia]
-    
-    idx_selecionado = st.radio(
-        "Como deseia receber os produtos? (Selecione a distância)",
-        range(len(labels_distancia)),
-        format_func=lambda i: formatar_opcao_distancia(labels_distancia[i]),
+    # Forma de recebimento - cliente escolhe apenas Retirada ou Entrega
+    # A coluna de preço é automaticamente definida pela distância cadastrada
+    coluna_preco_cliente = cliente.get("colunapreco") or "precoentrega"
+
+    opcoes_recebimento = ["Retirada no centro de distribuição", "Entrega"]
+    forma_recebimento = st.radio(
+        "Como deseja receber os produtos?",
+        opcoes_recebimento,
         key="forma_recebimento_cotacao"
     )
-    
-    forma_recebimento_label, coluna_preco = opcoes_distancia[idx_selecionado]
-    forma_recebimento = forma_recebimento_label  # Para compatibilidade com código anterior
+
+    if forma_recebimento == "Retirada no centro de distribuição":
+        coluna_preco = "precoretira"
+    else:
+        coluna_preco = coluna_preco_cliente
     
     pode_ver_preco = bool(cliente.get('visualiza_preco', True))
     
@@ -2283,6 +2285,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
