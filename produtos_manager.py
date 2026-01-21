@@ -287,7 +287,7 @@ def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
 
 def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Limpa dados: remove linhas vazias, normaliza preços, etc.
+    Limpa dados: remove linhas vazias, normaliza preços e garante unicidade do código.
     """
     # Remove linhas completamente vazias
     df = df.dropna(how='all')
@@ -295,18 +295,27 @@ def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
     # Reseta índice
     df = df.reset_index(drop=True)
     
-    # Remove espaços em branco das células de texto
-    for col in df.select_dtypes(include=['object']).columns:
-        df[col] = df[col].apply(
-            lambda x: str(x).strip() if pd.notna(x) else x
-        )
-    
-    # Remove duplicatas por código
+    # --- CORREÇÃO PRINCIPAL AQUI ---
+    # Normaliza a coluna 'codigo' para garantir que '7726' (int) e '7726' (str) sejam iguais
     if 'codigo' in df.columns:
+        # Converte para string e remove espaços extras
+        df['codigo'] = df['codigo'].apply(lambda x: str(x).strip() if pd.notna(x) else "")
+        # Remove códigos vazios que possam ter restado
+        df = df[df['codigo'] != ""]
+        
         tamanho_antes = len(df)
+        # Agora o drop_duplicates vai funcionar independente da formatação no Excel
         df = df.drop_duplicates(subset=['codigo'], keep='first')
+        
         if len(df) < tamanho_antes:
-            st.warning(f"⚠️ {tamanho_antes - len(df)} linhas duplicadas removidas")
+            st.warning(f"⚠️ {tamanho_antes - len(df)} linhas com códigos duplicados foram removidas.")
+
+    # Remove espaços em branco das outras células de texto
+    for col in df.select_dtypes(include=['object']).columns:
+        if col != 'codigo': # Já tratamos o código acima
+            df[col] = df[col].apply(
+                lambda x: str(x).strip() if pd.notna(x) else x
+            )
     
     # Limpa colunas de preço
     colunas_preco = ['retira', 'entrega', 'preco_padrao', 'preco_unitario']
@@ -315,7 +324,6 @@ def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].apply(converter_preco)
     
     return df
-
 
 def converter_preco(valor) -> float:
     """
@@ -534,3 +542,5 @@ def exibir_preview_dados(df: pd.DataFrame, max_linhas: int = 5):
     
     st.write("**Primeiras linhas:**")
     st.dataframe(df.head(max_linhas), use_container_width=True)
+
+
