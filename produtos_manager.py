@@ -43,9 +43,9 @@ MAPA_COLUNAS = {
     'preco_100a199km': 'preco_100a199km', 'preco100a199km': 'preco_100a199km',
     'preco_200a299km': 'preco_200a299km', 'preco200a299km': 'preco_200a299km',
     'preco_300a399km': 'preco_300a399km', 'preco300a399km': 'preco_300a399km',
-    'preco_acima400km': 'preco_acima400km', 'precoac400km': 'preco_acima400km',
-    'preco_acima500km': 'preco_acima500km', 'precoac500km': 'preco_acima500km',
-    'preco_acima600km': 'preco_acima600km', 'precoac600km': 'preco_acima600km',
+    'preco_acima400km': 'preco_acima400km', 'precoac400km': 'preco_acima400km', 'precoacima400km': 'preco_acima400km',
+    'preco_acima500km': 'preco_acima500km', 'precoac500km': 'preco_acima500km', 'precoacima500km': 'preco_acima500km',
+    'preco_acima600km': 'preco_acima600km', 'precoac600km': 'preco_acima600km', 'precoacima600km': 'preco_acima600km',
 }
 
 COLUNAS_OBRIGATORIAS = ['codigo', 'produto']
@@ -82,13 +82,55 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
 def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
     def limpar(col):
         c = str(col).strip().lower()
-        c = re.sub(r'[^a-z0-9_]', '', c) # Remove caracteres especiais
+
+        # troca caracteres acentuados comuns (preço -> preco)
+        c = (
+            c.replace("ç", "c")
+             .replace("ã", "a")
+             .replace("á", "a")
+             .replace("à", "a")
+             .replace("â", "a")
+             .replace("é", "e")
+             .replace("ê", "e")
+             .replace("í", "i")
+             .replace("ó", "o")
+             .replace("ô", "o")
+             .replace("õ", "o")
+             .replace("ú", "u")
+        )
+
+        # remove símbolos/espaços, deixa só a-z, 0-9 e _
+        c = re.sub(r'[^a-z0-9_]', '', c)
+
+        # remove sufixo numérico no fim: entrega_1 -> entrega / entrega1 -> entrega
+        c = re.sub(r'_\d+$', '', c)
+        c = re.sub(r'\d+$', '', c)
+
+        # colapsa underscores repetidos (se acontecer)
+        c = re.sub(r'_+', '_', c).strip('_')
+
         return c
-    
-    # 1. Limpeza básica
+
+    # 1) limpeza básica
     df.columns = [limpar(c) for c in df.columns]
-    # 2. Rename usando o mapa
+
+    # 2) resolve colunas duplicadas criadas pela limpeza (Excel faz isso direto)
+    # Ex.: 'entrega' e 'entrega_1' -> ambos viram 'entrega'
+    # Regra: mantém a primeira e renomeia as próximas com sufixo incremental
+    cols = []
+    contagem = {}
+    for c in df.columns:
+        if c not in contagem:
+            contagem[c] = 0
+            cols.append(c)
+        else:
+            contagem[c] += 1
+            cols.append(f"{c}_{contagem[c]}")
+    df.columns = cols
+
+    # 3) rename usando o mapa (seu MAPA_COLUNAS deve mapear: entrega -> preco_entrega etc.)
     df = df.rename(columns=MAPA_COLUNAS)
+
     return df
 
 def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
@@ -156,6 +198,15 @@ def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=
         # ---------------------------------------------------------
         # 1. UPSERT (Atualiza a base com a tabela nova)
         # ---------------------------------------------------------
+        # Mantém apenas colunas que existem na tabela produtos
+        colunas_validas = {
+            'representante_id', 'codigo', 'produto', 'unidade',
+            'preco_retira', 'preco_entrega',
+            'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
+            'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
+            'updated_at'
+        }
+        df = df[[c for c in df.columns if c in colunas_validas]].copy()
         records = df.to_dict('records')
         
         # Trata valores NaN para None (JSON null)
@@ -229,10 +280,40 @@ def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=
             
             # Passo D: Deleta
             if ids_final_delete:
+                # 1) Buscar cotações pendentes do representante
+                cot_pend = (
+                    supabase.table('cotacoes')
+                    .select('id')
+                    .eq('representante_id', representante_id)
+                    .eq('status', 'PENDENTE')
+                    .execute()
+                    .data
+                )
+                ids_cot_pend = [c['id'] for c in cot_pend] if cot_pend else []
+
+                # 2) Antes de deletar produtos, deletar itens de cotações PENDENTES que apontam pra eles
+                if ids_cot_pend:
+                    for i in range(0, len(ids_final_delete), 100):
+                        lote_prod = ids_final_delete[i:i+100]
+
+                        for j in range(0, len(ids_cot_pend), 100):
+                            lote_cot = ids_cot_pend[j:j+100]
+
+                            (
+                                supabase.table('cotacao_itens')
+                                .delete()
+                                .in_('produto_id', lote_prod)
+                                .in_('cotacao_id', lote_cot)
+                                .execute()
+                            )
+
+                # 3) Agora sim, deletar os produtos do catálogo (em lotes)
                 for i in range(0, len(ids_final_delete), 100):
                     lote_del = ids_final_delete[i:i+100]
                     supabase.table(tabela).delete().in_('id', lote_del).execute()
+
                 qtd_removidos = len(ids_final_delete)
+
 
         # ---------------------------------------------------------
         # 3. RECÁLCULO DE COTAÇÕES PENDENTES
@@ -367,6 +448,7 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
 def exibir_preview_dados(df: pd.DataFrame):
     st.write(f"Linhas: {len(df)} | Colunas: {len(df.columns)}")
     st.dataframe(df.head())
+
 
 
 
