@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 import re
+import unicodedata
 from fpdf import FPDF
 import bcrypt
 from supabase import create_client, Client
@@ -17,6 +18,15 @@ from produtos_manager import (
     validar_dados,
     limpar_dados
 )
+
+def normalizar_texto(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
 def data_brasil(data_iso):
     """Converte string ISO ou datetime UTC para string formatada BR (-3h)"""
     if not data_iso:
@@ -65,6 +75,15 @@ def parse_money(valor):
     except ValueError:
         return 0.0
     
+def normalizar_texto(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    # remove acentos: café -> cafe
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+ 
 def processar_tabela_produtos(arquivo):
     """
     Lê arquivos CSV ou Excel, padroniza as colunas e converte preços.
@@ -565,26 +584,54 @@ def carregar_produtos(representante_id):
     except Exception as e:
         st.error(f"Erro ao carregar produtos: {e}")
         return pd.DataFrame()
+    
+@st.cache_data(ttl=300)  # 5 minutos
+def carregar_catalogo_representante(representante_id: str) -> pd.DataFrame:
+    response = (
+        supabase.table('produtos')
+        .select('id,codigo,produto,unidade,preco_retira,preco_entrega,preco_100a199km,preco_200a299km,preco_300a399km,preco_acima400km,preco_acima500km,preco_acima600km')
+        .eq('representante_id', representante_id)
+        .execute()
+    )
+    data = response.data or []
+    return pd.DataFrame(data)
 
 def buscar_produtos(representante_id, termo):
-    """Busca produtos por código ou nome"""
+    """Busca produtos por código ou nome (sem exigir acento)"""
     try:
-        termo_limpo = termo.lower().strip()
-        response = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
-        
-        if not response.data:
+        termo_limpo = (termo or "").strip()
+        if not termo_limpo:
             return pd.DataFrame()
-        
-        df = pd.DataFrame(response.data)
-        
-        # Filtro no código ou produto
+
+        termo_norm = normalizar_texto(termo_limpo)
+
+        # Puxa o catálogo do representante via cache
+        df = carregar_catalogo_representante(representante_id)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # Garante strings
+        df["codigo"] = df["codigo"].astype(str)
+        df["produto"] = df["produto"].astype(str)
+
+        # Normaliza para busca sem acento
+        df["codigo_norm"] = df["codigo"].apply(normalizar_texto)
+        df["produto_norm"] = df["produto"].apply(normalizar_texto)
+
+        # Filtro no código ou produto (sem acento)
         mask = (
-            df['codigo'].str.lower().str.contains(termo_limpo, na=False) |
-            df['produto'].str.lower().str.contains(termo_limpo, na=False)
+            df["codigo_norm"].str.contains(termo_norm, na=False) |
+            df["produto_norm"].str.contains(termo_norm, na=False)
         )
-        
-        return df[mask].head(20)
-        
+
+        df_filtrado = df[mask].copy()
+
+        # Remove colunas auxiliares antes de retornar
+        df_filtrado.drop(columns=["codigo_norm", "produto_norm"], errors="ignore", inplace=True)
+
+        return df_filtrado.head(20)
+
     except Exception as e:
         st.error(f"Erro ao buscar produtos: {e}")
         return pd.DataFrame()
@@ -1179,115 +1226,116 @@ def pagina_dashboard(representante_id):
 def pagina_upload_tabela_precos(representante_id):
     """Página para upload da tabela de preços com validação robusta"""
     st.subheader("📤 Gerenciar Tabela de Preços")
-    
+
     # ========== STATUS ATUAL ==========
     produtos = carregar_produtos(representante_id)
-    
+
     if not produtos.empty:
-        if 'created_at' in produtos.columns:
-            ultima_atualizacao = pd.to_datetime(produtos['created_at']).max()
-            if ultima_atualizacao.tzinfo:
+        col_data = 'updated_at' if 'updated_at' in produtos.columns else (
+            'created_at' if 'created_at' in produtos.columns else None
+        )
+
+        if col_data:
+            ultima_atualizacao = pd.to_datetime(produtos[col_data]).max()
+            if getattr(ultima_atualizacao, "tzinfo", None):
                 ultima_atualizacao = ultima_atualizacao.tz_localize(None)
             ultima_atualizacao = ultima_atualizacao - pd.Timedelta(hours=3)
             data_fmt = ultima_atualizacao.strftime('%d/%m/%Y às %H:%M')
             st.success(f"✅ Tabela Ativa (Última atualização: **{data_fmt}**)")
         else:
             st.success("✅ Tabela Ativa")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("📦 Produtos", len(produtos))
-        with col2:
-            # CORREÇÃO: Usando 'preco_retira' e 'preco_entrega' (nomes do banco)
-            cols_calc = ['preco_retira', 'preco_entrega']
-            # Garante que as colunas existem antes de calcular
-            cols_existentes = [c for c in cols_calc if c in produtos.columns]
-            
-            if cols_existentes:
-                preco_medio = produtos[cols_existentes].fillna(0).astype(float).mean().mean()
-                st.metric("💰 Preço Médio", f"R$ {preco_medio:.2f}")
-            else:
-                st.metric("💰 Preço Médio", "R$ 0,00")
 
-        with col3:
-            if cols_existentes:
-                qtd_sem_preco = (produtos[cols_existentes].fillna(0).astype(float) == 0).sum().sum()
-                st.metric("⚠️ Sem Preço", qtd_sem_preco)
-            else:
-                st.metric("⚠️ Sem Preço", 0)
-        
+        # Produtos (quantidade) — simples e direto
+        st.write(f"**Produtos na tabela:** {len(produtos)}")
+
+        # (Opcional) controle de falhas: preços zerados/ausentes (sem mini-dashboard)
+        cols_calc = ['preco_retira', 'preco_entrega']
+        cols_existentes = [c for c in cols_calc if c in produtos.columns]
+        if cols_existentes:
+            qtd_sem_preco = (produtos[cols_existentes].fillna(0).astype(float) == 0).sum().sum()
+            if qtd_sem_preco > 0:
+                st.warning(f"⚠️ Existem **{qtd_sem_preco}** preços zerados/ausentes na tabela.")
+
+        # Visualização da tabela atual
         with st.expander("👁️ Visualizar tabela atual", expanded=False):
-            # CORREÇÃO: Ajustando nomes para visualização também
             cols_view = ['codigo', 'produto', 'unidade', 'preco_retira', 'preco_entrega']
             cols_disponiveis = [c for c in cols_view if c in produtos.columns]
-            st.dataframe(produtos[cols_disponiveis].head(50), use_container_width=True)
-        
-        st.warning("⚠️ Carregar uma nova tabela substituirá completamente os produtos existentes.")
+            st.dataframe(produtos[cols_disponiveis].head(50), width="stretch")
+
     else:
         st.info("📋 Nenhuma tabela de preços cadastrada ainda.")
-    
+
     # ========== UPLOAD DE NOVO ARQUIVO ==========
     st.markdown("---")
     st.markdown("### 📥 Carregar Nova Tabela de Preços")
-    
-    st.markdown("""
-    **Formatos suportados:** CSV (.csv), Excel (.xlsx, .xls)
-    
-    **Colunas obrigatórias:**
-    - `Código` (ou `codigo`, `Code`, `SKU`)
-    - `Produto` (ou `Nome`, `Descrição`)
-    
-    **Colunas recomendadas:**
-    - `Unidade` (UN, KG, etc)
-    - `Retira` ou `Preço Retirada` (preço sem frete)
-    - `Entrega` ou `Preço Entrega` (preço com frete)
-    
-    **Nota:** O sistema aceita variações de nomes de colunas e formata automaticamente.
-    """)
-    
+
     arquivo_upload = st.file_uploader(
         "Selecione o arquivo",
         type=['csv', 'xlsx', 'xls'],
-        help="CSV ou Excel com dados de produtos e preços"
+        help="Limit 200MB per file • CSV, XLSX, XLS"
     )
-    
+
+    st.caption("Formatos suportados: CSV (.csv), Excel (.xlsx, .xls)")
+
+    with st.expander("ℹ️ Regras do arquivo (colunas)", expanded=False):
+        st.markdown("""
+        **Colunas obrigatórias:**
+        - `Código` (ou `codigo`, `Code`, `SKU`)
+        - `Produto` (ou `Nome`, `Descrição`)
+
+        **Colunas recomendadas:**
+        - `Unidade` (UN, KG, etc)
+        - `Retira` ou `Preço Retirada` (preço sem frete)
+        - `Entrega` ou `Preço Entrega` (preço com frete)
+
+        **Nota:** O sistema aceita variações de nomes de colunas e formata automaticamente.
+        """)
+
     if arquivo_upload is not None:
         # ========== PROCESSAR E VALIDAR ==========
         df_processado = processar_arquivo_produtos(arquivo_upload)
-        
+
         if df_processado is not None:
-            # ========== PREVIEW ==========
+            st.success("✅ Arquivo processado com sucesso e pronto para sincronizar!")
+
+            # Resumo/preview da tabela carregada
             exibir_preview_dados(df_processado)
-            
+
+            # Alerta no lugar certo (perto do botão)
+            st.warning(
+                "⚠️ Ao atualizar, a tabela ativa passa a ser a do arquivo enviado. "
+                "Itens que não existirem mais no arquivo serão removidos da tabela do dia."
+            )
+
             # ========== CONFIRMAÇÃO ==========
             st.markdown("---")
             col1, col2 = st.columns([2, 1])
-            
+
             with col1:
-                st.write("✅ Arquivo processado com sucesso e pronto para sincronizar!")
-            
+                st.write("")
+
             with col2:
                 if st.button("🚀 Atualizar Dados", type="primary", key="btn_sincronizar"):
                     with st.spinner("⏳ Sincronizando produtos..."):
                         sucesso, mensagem = sincronizar_produtos_supabase(
-                            supabase_client=supabase,
+                            supabase=supabase,
                             df=df_processado,
                             tabela='produtos',
                             limpar_antes=True,
                             representante_id=representante_id
                         )
-                    
+
                     if sucesso:
                         st.success(mensagem)
                         st.balloons()
                         st.session_state['recarregar_pagina'] = True
                         import time
-                        time.sleep(2)
+                        time.sleep(1)
                         st.rerun()
                     else:
-                        st.error(mensagem)
-                        st.info("Verifique se a tabela 'produtos' existe no Supabase com as colunas corretas.")
-                        st.info("Colunas esperadas: codigo, produto, unidade, retira, entrega, representante_id, updated_at")
+                        st.error("Não consegui atualizar a tabela. Confere o arquivo e tenta novamente.")
+                        with st.expander("🔍 Detalhes (para suporte)", expanded=False):
+                            st.write(mensagem)
 
 def pagina_upload_clientes(representante_id):
     """Página para upload de clientes"""
@@ -1872,79 +1920,98 @@ def pagina_nova_cotacao(cliente):
     )
     
     if termo_busca and len(termo_busca.strip()) >= 3:
-        df_produtos = buscar_produtos(representante_id, termo_busca.strip())
-        
+        termo = termo_busca.strip()
+        termo_norm = normalizar_texto(termo)
+
+        # Busca no backend (como já está) e depois filtra sem acento no Python
+        df_produtos = buscar_produtos(representante_id, termo)
+
         if df_produtos.empty:
             st.warning("Nenhum produto encontrado")
         else:
-            opcoes = df_produtos.apply(
-                lambda row: f"{row['codigo']} - {row['produto']}",
-                axis=1
-            ).tolist()
-            
-            escolha = st.selectbox(
-                "Clique abaixo e escolha um produto da lista",
-                opcoes,
-                key="select_produto"
+            # garante colunas como string
+            df_produtos["produto"] = df_produtos["produto"].astype(str)
+            df_produtos["codigo"] = df_produtos["codigo"].astype(str)
+
+            # cria colunas normalizadas
+            df_produtos["produto_norm"] = df_produtos["produto"].apply(normalizar_texto)
+            df_produtos["codigo_norm"] = df_produtos["codigo"].apply(normalizar_texto)
+
+            # filtro acento-insensitive por produto OU código
+            mask = (
+                df_produtos["produto_norm"].str.contains(termo_norm, na=False) |
+                df_produtos["codigo_norm"].str.contains(termo_norm, na=False)
             )
-            
-            if escolha:
-                codigo_escolhido = escolha.split(' - ')[0]
-                produto_sel = df_produtos[df_produtos['codigo'] == codigo_escolhido].iloc[0]
-                
-                # Dados básicos
-                preco_retira = produto_sel.get('preco_retira')
-                id_produto_banco = produto_sel.get('id') or produto_sel.get('ID') or produto_sel.get('Id')
+            df_filtrado = df_produtos[mask].copy()
 
-                # Calcular preço
-                preco_final = get_preco_produto(produto_sel, coluna_preco, forma_recebimento)
-                
-                st.markdown("**Detalhes do produto:**")
-                st.write(f"Código: {produto_sel['codigo']}")
-                st.write(f"Produto: {produto_sel['produto']}")
-                st.write(f"Unidade: {produto_sel['unidade']}")
-                
-                if pode_ver_preco:
-                    if forma_recebimento == 'Retirada no centro de distribuição':
-                        if preco_retira:
-                            st.write(f"Preço para retirada: R$ {float(preco_retira):.2f}")
+            if df_filtrado.empty:
+                st.warning("Nenhum produto encontrado")
+            else:
+                opcoes = df_filtrado.apply(
+                    lambda row: f"{row['codigo']} - {row['produto']}",
+                    axis=1
+                ).tolist()
+
+                escolha = st.selectbox(
+                    "Clique abaixo e escolha um produto da lista",
+                    opcoes,
+                    key="select_produto"
+                )
+
+                if escolha:
+                    codigo_escolhido = escolha.split(' - ')[0]
+                    produto_sel = df_filtrado[df_filtrado['codigo'] == codigo_escolhido].iloc[0]
+
+                    # Dados básicos
+                    preco_retira = produto_sel.get('preco_retira')
+                    id_produto_banco = produto_sel.get('id') or produto_sel.get('ID') or produto_sel.get('Id')
+
+                    # Calcular preço
+                    preco_final = get_preco_produto(produto_sel, coluna_preco, forma_recebimento)
+
+                    st.markdown("**Detalhes do produto:**")
+                    st.write(f"Código: {produto_sel['codigo']}")
+                    st.write(f"Produto: {produto_sel['produto']}")
+                    st.write(f"Unidade: {produto_sel['unidade']}")
+
+                    if pode_ver_preco:
+                        if forma_recebimento == 'Retirada no centro de distribuição':
+                            if preco_retira:
+                                st.write(f"Preço para retirada: R$ {float(preco_retira):.2f}")
+                        else:
+                            if preco_final:
+                                st.write(f"Preço com frete: R$ {float(preco_final):.2f}")
                     else:
-                        if preco_final:
-                            st.write(f"Preço com frete: R$ {float(preco_final):.2f}")
-                else:
-                    st.info("Os preços serão calculados e enviados pelo representante.")
-                
-                qtd = st.number_input("Quantidade", min_value=1, value=1, step=1, key="qtd_add")
-                
-                # --- PREPARAÇÃO DOS DADOS ANTES DO BOTÃO ---
-                if not id_produto_banco:
-                    st.error("ERRO: Produto sem ID. Recarregue a página.")
-                else:
-                    val_final = float(preco_final) if preco_final is not None else 0.0
-                    subtotal_retira = (float(preco_retira) * qtd) if preco_retira is not None else 0.0
-                    subtotal_final = val_final * qtd
-                    
-                    # Criamos o dicionário do item AQUI, para passar pro botão
-                    item_para_adicionar = {
-                        "produto_id": id_produto_banco,
-                        "codigo": produto_sel['codigo'],
-                        "produto": produto_sel['produto'],
-                        "unidade": produto_sel['unidade'],
-                        "quantidade": qtd,
-                        "preco_retira": float(preco_retira) if preco_retira is not None else 0.0,
-                        "preco_final": val_final,
-                        "subtotal_retira": subtotal_retira,
-                        "subtotal_final": subtotal_final,
-                    }
+                        st.info("Os preços serão calculados e enviados pelo representante.")
 
-                    # --- BOTÃO COM CALLBACK (Correção do erro) ---
-                    st.button(
-                        "+ Adicionar à cotação", 
-                        key="btn_add_produto",
-                        on_click=add_item_callback,  # Chama a função de limpeza
-                        args=(item_para_adicionar,)  # Passa os dados
-                    )
+                    qtd = st.number_input("Quantidade", min_value=1, value=1, step=1, key="qtd_add")
 
+                    # --- PREPARAÇÃO DOS DADOS ANTES DO BOTÃO ---
+                    if not id_produto_banco:
+                        st.error("ERRO: Produto sem ID. Recarregue a página.")
+                    else:
+                        val_final = float(preco_final) if preco_final is not None else 0.0
+                        subtotal_retira = (float(preco_retira) * qtd) if preco_retira is not None else 0.0
+                        subtotal_final = val_final * qtd
+
+                        item_para_adicionar = {
+                            "produto_id": id_produto_banco,
+                            "codigo": produto_sel['codigo'],
+                            "produto": produto_sel['produto'],
+                            "unidade": produto_sel['unidade'],
+                            "quantidade": qtd,
+                            "preco_retira": float(preco_retira) if preco_retira is not None else 0.0,
+                            "preco_final": val_final,
+                            "subtotal_retira": subtotal_retira,
+                            "subtotal_final": subtotal_final,
+                        }
+
+                        st.button(
+                            "+ Adicionar à cotação",
+                            key="btn_add_produto",
+                            on_click=add_item_callback,
+                            args=(item_para_adicionar,)
+                        )
     elif termo_busca:
         st.info("Digite pelo menos 3 caracteres")
 
@@ -2214,7 +2281,7 @@ def pagina_cliente():
                     identificador = st.text_input("CNPJ ou Telefone", placeholder="Somente números")
                     senha = st.text_input("Senha", type="password")
                     
-                    if st.form_submit_button("ENTRAR", use_container_width=True):
+                    if st.form_submit_button("ENTRAR", width="stretch"):
                         if not identificador or not senha:
                             st.warning("Preencha todos os campos")
                         else:
@@ -2240,7 +2307,7 @@ def pagina_cliente():
                     nova_senha = st.text_input("Crie sua Senha", type="password", placeholder="......")
                     confirma_senha = st.text_input("Confirme sua Senha", type="password", placeholder="......")
                     
-                    btn_criar = st.form_submit_button("CRIAR CONTA", use_container_width=True)
+                    btn_criar = st.form_submit_button("CRIAR CONTA", width="stretch")
                     
                     if btn_criar:
                         if not identificador_ativ:
@@ -2312,6 +2379,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
