@@ -177,12 +177,6 @@ except Exception as e:
     st.stop()
 
 # =====================================================================
-# CONSTANTES E CONFIGURAÇÕES
-# =====================================================================
-
-TOKEN_ADMIN = "ADMIN123"  # Token para cadastro de novos representantes
-
-# =====================================================================
 # ESTILOS CSS
 # =====================================================================
 
@@ -343,45 +337,200 @@ def verificar_senha(senha, senha_hash):
     except: return False
 
 # =====================================================================
-# AUTENTICAÇÃO - REPRESENTANTE (Mantido original)
+# CONTROLE DE TENTATIVAS DE LOGIN (SEG-4)
+# =====================================================================
+
+MAX_TENTATIVAS_LOGIN = 5
+BLOQUEIO_MINUTOS = 15
+
+def limpar_tentativas_login(identificador: str, tipo_usuario: str):
+    """Zera contador após login bem-sucedido ou fim do prazo de bloqueio."""
+    id_norm = str(identificador).strip().lower()
+    if not id_norm:
+        return
+    try:
+        supabase.table('tentativas_login').update({
+            'tentativas': 0,
+            'bloqueado_ate': None,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        }).eq('identificador', id_norm).eq('tipo_usuario', tipo_usuario).execute()
+    except Exception:
+        pass
+
+def verificar_bloqueio_login(identificador: str, tipo_usuario: str):
+    """
+    Verifica se o identificador está bloqueado temporariamente.
+    Retorna (esta_bloqueado: bool, mensagem: str)
+    """
+    id_norm = str(identificador).strip().lower()
+    if not id_norm:
+        return False, ""
+
+    try:
+        resp = (
+            supabase.table('tentativas_login')
+            .select('*')
+            .eq('identificador', id_norm)
+            .eq('tipo_usuario', tipo_usuario)
+            .execute()
+        )
+        if not resp.data:
+            return False, ""
+
+        registro = resp.data[0]
+        bloqueado_ate_str = registro.get('bloqueado_ate')
+
+        if bloqueado_ate_str:
+            bloqueado_ate = pd.to_datetime(bloqueado_ate_str)
+            if bloqueado_ate.tzinfo is None:
+                bloqueado_ate = bloqueado_ate.tz_localize('UTC')
+
+            agora = datetime.now(timezone.utc)
+
+            if agora < bloqueado_ate:
+                segundos_restantes = int((bloqueado_ate - agora).total_seconds())
+                minutos_restantes = max(1, (segundos_restantes + 59) // 60)
+                return True, f"⛔ Acesso temporariamente bloqueado por excesso de tentativas. Tente novamente em {minutos_restantes} minuto(s)."
+            else:
+                # Tempo de bloqueio expirou: zera o contador automaticamente
+                limpar_tentativas_login(id_norm, tipo_usuario)
+
+        return False, ""
+    except Exception:
+        return False, ""
+
+def registrar_falha_login(identificador: str, tipo_usuario: str) -> str:
+    """
+    Incrementa tentativas erradas e aplica bloqueio ao atingir o limite.
+    Retorna mensagem informativa para exibir ao usuário.
+    """
+    id_norm = str(identificador).strip().lower()
+    if not id_norm:
+        return "Credenciais inválidas."
+
+    try:
+        resp = (
+            supabase.table('tentativas_login')
+            .select('*')
+            .eq('identificador', id_norm)
+            .eq('tipo_usuario', tipo_usuario)
+            .execute()
+        )
+
+        agora = datetime.now(timezone.utc)
+        tentativas_atuais = 0
+        registro_id = None
+
+        if resp.data:
+            registro = resp.data[0]
+            registro_id = registro['id']
+            tentativas_atuais = int(registro.get('tentativas', 0))
+
+        novas_tentativas = tentativas_atuais + 1
+        bloqueado_ate_iso = None
+
+        if novas_tentativas >= MAX_TENTATIVAS_LOGIN:
+            bloqueado_ate_iso = (agora + pd.Timedelta(minutes=BLOQUEIO_MINUTOS)).isoformat()
+            msg = f"⛔ Muitas tentativas incorretas. Acesso bloqueado por {BLOQUEIO_MINUTOS} minutos."
+        else:
+            restantes = MAX_TENTATIVAS_LOGIN - novas_tentativas
+            msg = f"Senha incorreta. Você tem mais {restantes} tentativa(s) antes do bloqueio temporário."
+
+        payload = {
+            'identificador': id_norm,
+            'tipo_usuario': tipo_usuario,
+            'tentativas': novas_tentativas,
+            'bloqueado_ate': bloqueado_ate_iso,
+            'updated_at': agora.isoformat()
+        }
+
+        if registro_id:
+            supabase.table('tentativas_login').update(payload).eq('id', registro_id).execute()
+        else:
+            supabase.table('tentativas_login').insert(payload).execute()
+
+        return msg
+    except Exception:
+        return "Usuário ou senha incorretos."    
+
+# =====================================================================
+# AUTENTICAÇÃO - REPRESENTANTE E ADMINISTRADORA
 # =====================================================================
 
 def autenticar_representante(email, senha):
+    email_limpo = str(email).strip().lower()
+    if not email_limpo:
+        return None, "Informe o e-mail."
+
+    bloqueado, msg_bloqueio = verificar_bloqueio_login(email_limpo, 'REPRESENTANTE')
+    if bloqueado:
+        return None, msg_bloqueio
+
     try:
-        response = supabase.auth.sign_in_with_password({"email": email, "password": senha})
+        response = supabase.auth.sign_in_with_password({"email": email_limpo, "password": senha})
         user_id = response.user.id
         rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
+        limpar_tentativas_login(email_limpo, 'REPRESENTANTE')
         return rep_data.data, "Login realizado com sucesso!"
-    except: return None, "Usuário ou senha incorretos"
-
-def cadastrar_representante(nome, email, senha, telefone):
+    except Exception:
+        msg_falha = registrar_falha_login(email_limpo, 'REPRESENTANTE')
+        return None, f"Usuário ou senha incorretos. {msg_falha}"
+    
+def criar_representante_admin(nome, email, senha, telefone):
+    """Cria representante via API administrativa do Supabase (funciona com cadastro público desligado)"""
     try:
-        response = supabase.auth.sign_up({"email": email, "password": senha})
+        # 1. Cria o usuário no Supabase Auth usando permissão administrativa (service_role)
+        response = supabase.auth.admin.create_user({
+            "email": email.strip(),
+            "password": senha,
+            "email_confirm": True
+        })
+        user_id = response.user.id
+
+        # 2. Insere o perfil na tabela representantes
         supabase.table('representantes').insert({
-            'id': response.user.id, 'nome': nome, 'email': email, 'telefone': telefone
+            'id': user_id,
+            'nome': nome.strip(),
+            'email': email.strip(),
+            'telefone': so_digitos(telefone) if telefone else None
         }).execute()
-        return True, "Representante cadastrado com sucesso!"
-    except Exception as e: return False, f"Erro ao cadastrar: {str(e)}"
+
+        return True, f"Representante '{nome}' cadastrado com sucesso!"
+    except Exception as e:
+        return False, f"Erro ao cadastrar representante: {str(e)}"
 
 # =====================================================================
 # AUTENTICAÇÃO E LÓGICA - CLIENTE (Aqui está a correção!)
 # =====================================================================
 
 def autenticar_cliente(identificador, senha):
-    """Busca cliente por CNPJ/Tel e valida senha"""
+    """Busca cliente por CNPJ/Tel, verifica bloqueio e valida senha"""
     id_limpo = so_digitos(identificador)
-    if not id_limpo: return None, "Digite apenas números."
-    
+    if not id_limpo:
+        return None, "Digite apenas números."
+
+    bloqueado, msg_bloqueio = verificar_bloqueio_login(id_limpo, 'CLIENTE')
+    if bloqueado:
+        return None, msg_bloqueio
+
     try:
         response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if not response.data: return None, "Cliente não encontrado."
-        
+        if not response.data:
+            msg_falha = registrar_falha_login(id_limpo, 'CLIENTE')
+            return None, f"Cliente não encontrado ou credenciais inválidas. {msg_falha}"
+
         cliente = response.data[0]
-        if not cliente.get('senha_hash'): return None, "Conta não ativada. Crie sua senha primeiro."
-        
-        if verificar_senha(senha, cliente['senha_hash']): return cliente, "Login com sucesso!"
-        else: return None, "Senha incorreta."
-    except Exception as e: return None, f"Erro: {e}"
+        if not cliente.get('senha_hash'):
+            return None, "Conta não ativada. Crie sua senha primeiro."
+
+        if verificar_senha(senha, cliente['senha_hash']):
+            limpar_tentativas_login(id_limpo, 'CLIENTE')
+            return cliente, "Login com sucesso!"
+        else:
+            msg_falha = registrar_falha_login(id_limpo, 'CLIENTE')
+            return None, msg_falha
+    except Exception:
+        return None, "Erro ao validar acesso. Tente novamente."
 
 def ativar_senha_cliente(identificador, nova_senha):
     """Ativa senha apenas para cliente validado pelo representante e ainda sem senha (SEG-1)"""
@@ -1733,6 +1882,78 @@ def pagina_gerenciar_cotacoes(representante_id):
                             link_whats = f"https://wa.me/55{tel_limpo}?text={texto_msg}"
                             st.link_button(label="💬 WhatsApp", url=link_whats, type="secondary")
 
+def pagina_administradora():
+    """Área restrita da administradora para gestão de representantes"""
+    local_css()
+
+    if 'admin_logada' not in st.session_state:
+        st.session_state.admin_logada = False
+
+    if not st.session_state.admin_logada:
+        col_esq, col_centro, col_dir = st.columns([1, 2, 1])
+        with col_centro:
+            st.markdown('<div class="main-header">Área da Administradora</div>', unsafe_allow_html=True)
+            with st.form("form_login_admin"):
+                senha_admin = st.text_input("Senha da Administradora", type="password")
+                if st.form_submit_button("ENTRAR", width="stretch"):
+                    bloqueado, msg_bloqueio = verificar_bloqueio_login("admin_principal", "ADMIN")
+                    if bloqueado:
+                        st.error(msg_bloqueio)
+                    else:
+                        senha_correta = st.secrets.get("ADMIN_PASSWORD", "")
+                        if senha_correta and senha_admin == senha_correta:
+                            limpar_tentativas_login("admin_principal", "ADMIN")
+                            st.session_state.admin_logada = True
+                            st.rerun()
+                        else:
+                            msg_falha = registrar_falha_login("admin_principal", "ADMIN")
+                            st.error(f"❌ {msg_falha}")
+        return
+
+    # --- ÁREA LOGADA DA ADMINISTRADORA ---
+    st.sidebar.title("Painel Administradora")
+    if st.sidebar.button("Sair da Administração"):
+        st.session_state.admin_logada = False
+        st.rerun()
+
+    st.title("🔐 Gestão de Representantes")
+    st.write("Cadastre novos representantes autorizados a acessar o sistema.")
+
+    with st.expander("➕ Cadastrar Novo Representante", expanded=True):
+        with st.form("form_cadastro_rep_admin"):
+            nome_rep = st.text_input("Nome Completo *")
+            email_rep = st.text_input("E-mail de Acesso *")
+            telefone_rep = st.text_input("Telefone / WhatsApp (com DDD)")
+            pass_rep = st.text_input("Senha Inicial *", type="password")
+            pass_rep_conf = st.text_input("Confirme a Senha *", type="password")
+
+            if st.form_submit_button("CADASTRAR REPRESENTANTE", type="primary"):
+                if not (nome_rep and email_rep and pass_rep):
+                    st.error("❌ Preencha Nome, E-mail e Senha.")
+                elif len(pass_rep) < 6:
+                    st.error("❌ A senha deve ter pelo menos 6 caracteres.")
+                elif pass_rep != pass_rep_conf:
+                    st.error("❌ As senhas não coincidem.")
+                else:
+                    sucesso, msg = criar_representante_admin(nome_rep, email_rep, pass_rep, telefone_rep)
+                    if sucesso:
+                        st.success(f"✅ {msg}")
+                    else:
+                        st.error(f"❌ {msg}")
+
+    st.markdown("---")
+    st.subheader("📋 Representantes Cadastrados")
+    try:
+        reps = supabase.table('representantes').select('id, nome, email, telefone, created_at').execute()
+        if reps.data:
+            df_reps = pd.DataFrame(reps.data)
+            st.dataframe(df_reps[['nome', 'email', 'telefone']], hide_index=True, width="stretch")
+        else:
+            st.info("Nenhum representante cadastrado.")
+    except Exception as e:
+        st.error(f"Erro ao listar representantes: {e}")
+
+
 def pagina_representante():
     """Página principal do representante"""
     local_css()
@@ -1741,22 +1962,19 @@ def pagina_representante():
         st.session_state.representante_logado = None
     
     if st.session_state.representante_logado is None:
-        # Tela de login/cadastro
+        # Tela apenas de Login (cadastro público removido no SEG-3)
         col_esq, col_centro, col_dir = st.columns([1, 2, 1])
         
         with col_centro:
             st.markdown('<div class="main-header">Área do Representante</div>', unsafe_allow_html=True)
-            st.markdown("Acesse o sistema ou crie um cadastro.", unsafe_allow_html=True)
+            st.info("ℹ️ Acesso restrito a representantes cadastrados pela administração.")
             
-            tab1, tab2 = st.tabs(["Login", "Novo Cadastro"])
-            
-            with tab1:
+            with st.form("form_login_rep"):
                 st.subheader("Acesse o sistema")
                 login_email = st.text_input("E-mail", key="rep_email")
                 login_senha = st.text_input("Senha", type="password", key="rep_senha")
-                st.write("")
                 
-                if st.button("ENTRAR", key="btn_rep_login"):
+                if st.form_submit_button("ENTRAR", width="stretch"):
                     if login_email and login_senha:
                         usuario, msg = autenticar_representante(login_email, login_senha)
                         if usuario is not None:
@@ -1767,35 +1985,6 @@ def pagina_representante():
                             st.error(msg)
                     else:
                         st.warning("Preencha todos os campos")
-            
-            with tab2:
-                st.subheader("Cadastro de Novo Representante")
-                st.warning("⚠️ Para criar uma conta, você precisa do Token de Autorização da empresa.")
-                
-                with st.form("form_novo_rep"):
-                    nome_rep = st.text_input("Seu Nome Completo", key="nome_rep_cadastro")
-                    email_rep = st.text_input("Seu E-mail", key="email_rep_cadastro")
-                    telefone_rep = st.text_input("Seu Telefone (opcional)", key="telefone_rep_cadastro")
-                    user_rep = st.text_input("Crie um Usuário (Login)", key="user_rep_cadastro")
-                    pass_rep = st.text_input("Crie uma Senha", type="password", key="pass_rep_cadastro")
-                    pass_rep_conf = st.text_input("Confirme a Senha", type="password", key="pass_rep_confirm")
-                    token_seguranca = st.text_input("Token de Admin", type="password", help="Digite o Token recebido na contratação", key="token_admin_cadastro")
-                    
-                    submit_novo_rep = st.form_submit_button("CADASTRAR")
-                    
-                    if submit_novo_rep:
-                        if token_seguranca != TOKEN_ADMIN:
-                            st.error("❌ Token de Admin inválido! Cadastro não permitido.")
-                        elif not (nome_rep and email_rep and pass_rep):
-                            st.error("❌ Preencha todos os campos obrigatórios.")
-                        elif pass_rep != pass_rep_conf:
-                            st.error("❌ As senhas não coincidem.")
-                        else:
-                            sucesso, msg = cadastrar_representante(nome_rep, email_rep, pass_rep, telefone_rep)
-                            if sucesso:
-                                st.success("✅ Conta criada com sucesso! Faça login na outra aba.")
-                            else:
-                                st.error(msg)
         return
     
     # Representante logado
@@ -2384,12 +2573,14 @@ def main():
     local_css()
     
     st.sidebar.title("RC Online")
-    tipo_usuario = st.sidebar.radio("Tipo de Acesso", ["Cliente", "Representante"])
+    tipo_usuario = st.sidebar.radio("Tipo de Acesso", ["Cliente", "Representante", "Administradora"])
     
     if tipo_usuario == "Cliente":
         pagina_cliente()
-    else:
+    elif tipo_usuario == "Representante":
         pagina_representante()
+    else:
+        pagina_administradora()
 
 if __name__ == "__main__":
     main()
