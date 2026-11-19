@@ -384,18 +384,32 @@ def autenticar_cliente(identificador, senha):
     except Exception as e: return None, f"Erro: {e}"
 
 def ativar_senha_cliente(identificador, nova_senha):
-    """Busca cliente por CNPJ/Tel e grava nova senha"""
+    """Ativa senha apenas para cliente validado pelo representante e ainda sem senha (SEG-1)"""
     id_limpo = so_digitos(identificador)
-    if not id_limpo: return False, "Identificador inválido."
+    if not id_limpo:
+        return False, "Identificador inválido. Digite apenas números."
     
     try:
         response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if not response.data: return False, "Cliente não encontrado na base."
+        if not response.data:
+            return False, "Cadastro não localizado. Fale com seu representante."
         
         cliente = response.data[0]
-        supabase.table('clientes').update({'senha_hash': hash_senha(nova_senha)}).eq('id', cliente['id']).execute()
-        return True, "Senha criada com sucesso!"
-    except Exception as e: return False, f"Erro: {e}"
+
+        # Trava 1: Prospect ainda não validado não pode ativar senha
+        if cliente.get('status_cliente') != 'CLIENTE':
+            return False, "Seu cadastro ainda aguarda validação do representante."
+
+        # Trava 2: Conta já possui senha ativa (impede sequestro/sobrescrita)
+        if cliente.get('senha_hash'):
+            return False, "Esta conta já possui senha cadastrada. Faça login na aba 'Já tenho senha' ou peça ao representante para resetar."
+
+        supabase.table('clientes').update({
+            'senha_hash': hash_senha(nova_senha)
+        }).eq('id', cliente['id']).execute()
+        return True, "Senha criada com sucesso! Agora acesse a aba 'Já tenho senha' para entrar."
+    except Exception as e:
+        return False, "Não foi possível ativar a senha no momento. Tente novamente."
 
 # Mantemos estas por compatibilidade caso seu código antigo use
 def buscar_cliente_para_cadastro(identificador):
@@ -545,8 +559,10 @@ def upload_clientes_excel(arquivo, representante_id):
                 'distancia_km': dist_val,
                 'coluna_preco': coluna_preco,
                 'visualiza_preco': visualiza,
-                'senha_hash': hash_senha('temp123')
+                'status_cliente': 'CLIENTE'
             }
+            if not cliente_id:
+                cliente_dict['senha_hash'] = None
             
             # SE ACHAMOS O ID, ADICIONAMOS AO DICIONÁRIO
             # Isso força o Supabase a fazer UPDATE na linha certa, evitando conflito de chave única
@@ -1465,8 +1481,6 @@ def pagina_gestao_clientes(representante_id):
                     # -----------------------------------------
                     
                     try:
-                        senha_padrao_hash = hash_senha("123456")
-                        
                         supabase.table('clientes').insert({
                             'representante_id': representante_id,
                             'nome': nome_novo.upper(),
@@ -1476,10 +1490,11 @@ def pagina_gestao_clientes(representante_id):
                             'distancia_km': dist,
                             'coluna_preco': coluna_preco,
                             'visualiza_preco': pode_ver_preco_novo,
-                            'senha_hash': senha_padrao_hash
+                            'status_cliente': 'CLIENTE',
+                            'senha_hash': None
                         }).execute()
                         
-                        st.success(f"✅ Cliente {nome_novo} cadastrado! Faixa de preço definida: {coluna_preco}")
+                        st.success(f"✅ Cliente {nome_novo} cadastrado! Ele já pode criar sua própria senha no 1º acesso.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Erro ao cadastrar: {e}. Verifique se o CNPJ já não existe.")
@@ -1552,15 +1567,14 @@ def pagina_gestao_clientes(representante_id):
                     st.toast(f"Permissão de {row['nome']} atualizada!")
             
             with col3:
-                # Botão de Reset de Senha
+                # Botão de Reset de Senha (libera o cliente para criar nova senha no 1º acesso)
                 if st.button("🔄 Resetar Senha", key=f"reset_{row['id']}"):
                     try:
-                        nova_senha_padrao = "123456"
                         supabase.table('clientes').update({
-                            'senha_hash': hash_senha(nova_senha_padrao)
+                            'senha_hash': None
                         }).eq('id', row['id']).execute()
                         
-                        st.success(f"Senha de {row['nome']} resetada para '123456'!")
+                        st.success(f"Senha de {row['nome']} limpa! O cliente já pode cadastrar uma nova senha no 1º acesso.")
                     except Exception as e:
                         st.error("Erro ao resetar senha.")
             
@@ -2313,7 +2327,7 @@ def pagina_cliente():
                         if not identificador_ativ:
                             st.warning("Digite seu CNPJ ou Telefone.")
                         elif not nova_senha or len(nova_senha) < 4:
-                            st.warning("A senha deve ter pelo menos 4 caracteres.")
+                            st.warning("A senha deve ter pelo menos 6 caracteres.")
                         elif nova_senha != confirma_senha:
                             st.error("As senhas não coincidem.")
                         else:
