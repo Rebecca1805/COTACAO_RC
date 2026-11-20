@@ -588,12 +588,12 @@ def carregar_clientes(representante_id):
         st.error(f"Erro ao carregar clientes: {e}")
         return pd.DataFrame()
 
-def atualizar_visualiza_preco(cliente_id, pode_ver):
-    """Atualiza flag de visualização de preço do cliente"""
+def atualizar_visualiza_preco(cliente_id, pode_ver, representante_id):
+    """Atualiza flag de visualização de preço garantindo isolamento por representante"""
     try:
         supabase.table('clientes').update({
             'visualiza_preco': pode_ver
-        }).eq('id', cliente_id).execute()
+        }).eq('id', cliente_id).eq('representante_id', representante_id).execute()
         return True
     except Exception as e:
         st.error(f"Erro ao atualizar: {e}")
@@ -1091,73 +1091,81 @@ def salvar_cotacao(representante_id, cliente_id, cliente_nome, itens, forma_rece
         st.error(f"Erro ao salvar cotação: {e}")
         return None
 
-def atualizar_status_cotacao(cotacao_id, novo_status):
-    """Atualiza status da cotação"""
+def atualizar_status_cotacao(cotacao_id, novo_status, representante_id):
+    """Atualiza status da cotação garantindo isolamento por representante"""
     try:
         supabase.table('cotacoes').update({
             'status': novo_status
-        }).eq('id', cotacao_id).execute()
+        }).eq('id', cotacao_id).eq('representante_id', representante_id).execute()
         st.success(f"Status atualizado para {novo_status}!")
     except Exception as e:
         st.error(f"Erro ao atualizar status: {e}")
 
-def aplicar_desconto_geral(cotacao_id, desconto_percentual):
-    """Aplica desconto geral na cotação"""
+def aplicar_desconto_geral(cotacao_id, desconto_percentual, representante_id):
+    """Aplica desconto geral na cotação garantindo isolamento por representante"""
     try:
-        # Buscar cotação
-        cot = supabase.table('cotacoes').select('*').eq('id', cotacao_id).single().execute()
+        cot = (
+            supabase.table('cotacoes')
+            .select('*')
+            .eq('id', cotacao_id)
+            .eq('representante_id', representante_id)
+            .single()
+            .execute()
+        )
         total_original = float(cot.data['total_original'])
-        
-        # Calcular novo total
         novo_total = total_original * (1 - desconto_percentual / 100)
-        
-        # Atualizar
+
         supabase.table('cotacoes').update({
             'desconto_geral_percentual': desconto_percentual,
             'total_final': novo_total
-        }).eq('id', cotacao_id).execute()
-        
+        }).eq('id', cotacao_id).eq('representante_id', representante_id).execute()
+
         st.success(f"Desconto de {desconto_percentual}% aplicado!")
-        
     except Exception as e:
         st.error(f"Erro ao aplicar desconto: {e}")
 
-def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual):
+def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual, representante_id):
     """
-    1. Atualiza descontos individuais e subtotais de cada item
-    2. Recalcula o total da cotação
-    3. Reaplica o desconto geral e SALVA a porcentagem
+    1. Confirma que a cotação pertence ao representante logado
+    2. Atualiza descontos individuais e subtotais de cada item
+    3. Recalcula o total da cotação e salva no banco
     """
     try:
+        # Trava de isolamento: confirma posse da cotação antes de alterar itens
+        check = (
+            supabase.table('cotacoes')
+            .select('id')
+            .eq('id', cotacao_id)
+            .eq('representante_id', representante_id)
+            .execute()
+        )
+        if not check.data:
+            st.error("Cotação não encontrada ou sem permissão de acesso.")
+            return False
+
         soma_subtotais = 0.0
-        
-        # 1. Atualizar cada item no banco
+
         for _, row in df_itens_editado.iterrows():
             preco = float(row['Preço Unit.'])
             qtd = float(row['Qtde'])
-            
-            # Pega o desconto do item (garantindo que não seja nulo)
             desc_item = float(row.get('Desconto (%)', 0.0))
-            
-            # Cálculo do subtotal do item com desconto
+
             novo_subtotal = (preco * qtd) * (1 - desc_item / 100)
             soma_subtotais += novo_subtotal
-            
+
             supabase.table('cotacao_itens').update({
                 'desconto_percentual': desc_item,
                 'subtotal': novo_subtotal
             }).eq('cotacao_id', cotacao_id).eq('codigo', row['Código']).execute()
-            
-        # 2. Atualizar totais da Cotação
+
         total_final = soma_subtotais * (1 - desconto_geral_atual / 100)
-        
-        # --- A CORREÇÃO ESTÁ AQUI EMBAIXO ---
+
         supabase.table('cotacoes').update({
-            'total_original': soma_subtotais, 
+            'total_original': soma_subtotais,
             'total_final': total_final,
-            'desconto_geral_percentual': desconto_geral_atual  # <--- FALTAVA ISSO!
-        }).eq('id', cotacao_id).execute()
-        
+            'desconto_geral_percentual': desconto_geral_atual
+        }).eq('id', cotacao_id).eq('representante_id', representante_id).execute()
+
         return True
     except Exception as e:
         st.error(f"Erro ao recalcular: {e}")
@@ -1167,15 +1175,25 @@ def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual
 # GERAÇÃO DE PDF
 # =====================================================================
 
-def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True):
+def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cliente_id=None):
     """
-    Gera PDF da cotação com detalhamento de descontos (Total Real, Item e Extra)
+    Gera PDF da cotação validando o dono da sessão (representante_id ou cliente_id)
     """
     try:
-        # Buscar cotação
-        cot_response = supabase.table('cotacoes').select('*, clientes(nome, telefone)').eq('id', cotacao_id).single().execute()
+        query = supabase.table('cotacoes').select('*, clientes(nome, telefone)').eq('id', cotacao_id)
+
+        if representante_id:
+            query = query.eq('representante_id', representante_id)
+        elif cliente_id:
+            query = query.eq('cliente_id', cliente_id)
+        else:
+            return b''
+
+        cot_response = query.single().execute()
         cotacao = cot_response.data
-        
+        if not cotacao:
+            return b''
+
         # Buscar itens
         itens_response = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cotacao_id).execute()
         itens = itens_response.data
@@ -1710,21 +1728,21 @@ def pagina_gestao_clientes(representante_id):
                     key=f"visupreco_{row['id']}"
                 )
                 
-                # Se mudou o valor, salva imediatamente no banco
+                # Se mudou o valor, salva imediatamente no banco validando o representante
                 if novo_valor != valor_atual:
-                    atualizar_visualiza_preco(row['id'], novo_valor)
+                    atualizar_visualiza_preco(row['id'], novo_valor, representante_id)
                     st.toast(f"Permissão de {row['nome']} atualizada!")
             
             with col3:
-                # Botão de Reset de Senha (libera o cliente para criar nova senha no 1º acesso)
+                # Botão de Reset de Senha (isolado por representante_id)
                 if st.button("🔄 Resetar Senha", key=f"reset_{row['id']}"):
                     try:
                         supabase.table('clientes').update({
                             'senha_hash': None
-                        }).eq('id', row['id']).execute()
+                        }).eq('id', row['id']).eq('representante_id', representante_id).execute()
                         
                         st.success(f"Senha de {row['nome']} limpa! O cliente já pode cadastrar uma nova senha no 1º acesso.")
-                    except Exception as e:
+                    except Exception:
                         st.error("Erro ao resetar senha.")
             
             st.markdown("---")
@@ -1842,14 +1860,14 @@ def pagina_gerenciar_cotacoes(representante_id):
                     st.write("")
                     st.write("")
                     if st.button("💾 Salvar Tudo", type="primary", key=f"btn_save_all_{cot['id']}"):
-                        sucesso = recalcular_e_salvar_itens(cot['id'], df_editado, novo_desconto_geral)
+                        sucesso = recalcular_e_salvar_itens(cot['id'], df_editado, novo_desconto_geral, representante_id)
                         if sucesso:
                             st.success("Cotação recalculada e salva com sucesso!")
                             st.rerun()
             else:
                 st.warning("⚠️ Esta cotação não possui itens registrados.")
                 if st.button("🗑️ Excluir esta cotação vazia", key=f"btn_del_cot_{cot['id']}"):
-                    supabase.table('cotacoes').delete().eq('id', cot['id']).execute()
+                    supabase.table('cotacoes').delete().eq('id', cot['id']).eq('representante_id', representante_id).execute()
                     st.success("Cotação excluída.")
                     st.rerun()
 
@@ -1865,14 +1883,14 @@ def pagina_gerenciar_cotacoes(representante_id):
                     novo_status = st.selectbox("Status", status_opcoes, index=idx_atual, key=f"status_{cot['id']}", label_visibility="collapsed")
                 with col_st_2:
                     if st.button("Atualizar", key=f"btn_status_{cot['id']}"):
-                        atualizar_status_cotacao(cot['id'], novo_status)
+                        atualizar_status_cotacao(cot['id'], novo_status, representante_id)
                         st.rerun()
             
             with c_acoes:
                 st.markdown("**Ações**")
                 col_ac_1, col_ac_2 = st.columns(2)
                 with col_ac_1:
-                    pdf_bytes = gerar_pdf_cotacao(cot['id'], True)
+                    pdf_bytes = gerar_pdf_cotacao(cot['id'], True, representante_id=representante_id)
                     st.download_button(label="📄 Baixar PDF", data=pdf_bytes, file_name=f"cotacao_{cot['id']}.pdf", mime="application/pdf", key=f"pdf_{cot['id']}")
                 with col_ac_2:
                     if telefone and telefone != "N/A":
@@ -2407,8 +2425,8 @@ def pagina_meus_pedidos(cliente):
                 
                 st.dataframe(df_show, width='stretch')
             
-            # 5. Controla visualização no PDF
-            pdf_bytes = gerar_pdf_cotacao(cot['id'], mostrar_precos_nesta_cotacao)
+            # 5. Controla visualização no PDF (validando cliente_id da sessão)
+            pdf_bytes = gerar_pdf_cotacao(cot['id'], mostrar_precos_nesta_cotacao, cliente_id=cliente['id'])
             st.download_button(
                 label="📄 Baixar PDF",
                 data=pdf_bytes,
