@@ -1291,8 +1291,8 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True):
 # =====================================================================
 
 def pagina_dashboard(representante_id):
-    """Dashboard do representante"""
-    st.title("📊 Dashboard Gerencial")
+    """Painel Gerencial do representante"""
+    st.title("📊 Painel Gerencial")
     
     # --- CÁLCULO DE DADOS ---
     clientes = carregar_clientes(representante_id)
@@ -1994,7 +1994,7 @@ def pagina_representante():
     st.sidebar.title(f"Olá, {rep.get('nome', 'Representante')}!")
     menu = st.sidebar.radio(
         "Menu",
-        ["Dashboard", "Importar Tabela de Preços", "Importar Clientes", "Gestão de Clientes", "Gerenciar Cotações"]
+        ["Painel Gerencial", "Importar Tabela de Preços", "Importar Clientes", "Gestão de Clientes", "Gerenciar Cotações"]
     )
     
     if st.sidebar.button("Sair"):
@@ -2013,7 +2013,7 @@ def pagina_representante():
     </small>
     """, unsafe_allow_html=True)
     
-    if menu == "Dashboard":
+    if menu == "Painel Gerencial":
         pagina_dashboard(representante_id)
     elif menu == "Importar Tabela de Preços":
         pagina_upload_tabela_precos(representante_id)
