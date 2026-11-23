@@ -1,3 +1,4 @@
+import hmac
 import html
 import logging
 import os
@@ -97,15 +98,6 @@ def parse_money(valor):
         return float(texto)
     except ValueError:
         return 0.0
-    
-def normalizar_texto(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    # remove acentos: café -> cafe
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
  
 def processar_tabela_produtos(arquivo):
     """
@@ -346,14 +338,6 @@ def parse_preco(valor):
     """(Alias para manter compatibilidade)"""
     return parse_money(valor)
 
-def parse_money(valor):
-    """Converte string de dinheiro BR para float"""
-    if valor is None or pd.isna(valor) or valor == "": return 0.0
-    if isinstance(valor, (int, float)): return float(valor)
-    texto = str(valor).strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
-    try: return float(texto)
-    except ValueError: return 0.0
-
 def hash_senha(senha):
     """Gera hash da senha"""
     return bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -483,61 +467,7 @@ def registrar_falha_login(identificador: str, tipo_usuario: str) -> str:
         return msg
     except Exception as e:
         registrar_erro(f"Registrar falha de login ({tipo_usuario})", e)
-        return "Usuário ou senha incorretos."
-    
-def registrar_falha_login(identificador: str, tipo_usuario: str) -> str:
-    """
-    Incrementa tentativas erradas e aplica bloqueio ao atingir o limite.
-    Retorna mensagem informativa para exibir ao usuário.
-    """
-    id_norm = str(identificador).strip().lower()
-    if not id_norm:
-        return "Credenciais inválidas."
-
-    try:
-        resp = (
-            supabase.table('tentativas_login')
-            .select('*')
-            .eq('identificador', id_norm)
-            .eq('tipo_usuario', tipo_usuario)
-            .execute()
-        )
-
-        agora = datetime.now(timezone.utc)
-        tentativas_atuais = 0
-        registro_id = None
-
-        if resp.data:
-            registro = resp.data[0]
-            registro_id = registro['id']
-            tentativas_atuais = int(registro.get('tentativas', 0))
-
-        novas_tentativas = tentativas_atuais + 1
-        bloqueado_ate_iso = None
-
-        if novas_tentativas >= MAX_TENTATIVAS_LOGIN:
-            bloqueado_ate_iso = (agora + pd.Timedelta(minutes=BLOQUEIO_MINUTOS)).isoformat()
-            msg = f"⛔ Muitas tentativas incorretas. Acesso bloqueado por {BLOQUEIO_MINUTOS} minutos."
-        else:
-            restantes = MAX_TENTATIVAS_LOGIN - novas_tentativas
-            msg = f"Senha incorreta. Você tem mais {restantes} tentativa(s) antes do bloqueio temporário."
-
-        payload = {
-            'identificador': id_norm,
-            'tipo_usuario': tipo_usuario,
-            'tentativas': novas_tentativas,
-            'bloqueado_ate': bloqueado_ate_iso,
-            'updated_at': agora.isoformat()
-        }
-
-        if registro_id:
-            supabase.table('tentativas_login').update(payload).eq('id', registro_id).execute()
-        else:
-            supabase.table('tentativas_login').insert(payload).execute()
-
-        return msg
-    except Exception:
-        return "Usuário ou senha incorretos."    
+        return "Usuário ou senha incorretos."   
 
 # =====================================================================
 # AUTENTICAÇÃO - REPRESENTANTE E ADMINISTRADORA
@@ -559,7 +489,7 @@ def autenticar_representante(email, senha):
         limpar_tentativas_login(email_limpo, 'REPRESENTANTE')
         return rep_data.data, "Login realizado com sucesso!"
     except Exception as e:
-        registrar_erro("Autenticação de representante", e)
+        logger.warning(f"Falha na autenticação do representante ({type(e).__name__})")
         msg_falha = registrar_falha_login(email_limpo, 'REPRESENTANTE')
         return None, f"Usuário ou senha incorretos. {msg_falha}"
     
@@ -2004,7 +1934,7 @@ def pagina_administradora():
                         st.error(msg_bloqueio)
                     else:
                         senha_correta = st.secrets.get("ADMIN_PASSWORD", "")
-                        if senha_correta and senha_admin == senha_correta:
+                        if senha_correta and hmac.compare_digest(str(senha_admin), str(senha_correta)):
                             limpar_tentativas_login("admin_principal", "ADMIN")
                             st.session_state.admin_logada = True
                             st.rerun()

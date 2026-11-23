@@ -7,6 +7,7 @@ ATUALIZADO:
 - Recálculo automático de cotações PENDENTES.
 """
 
+import logging
 import pandas as pd
 import numpy as np
 import re
@@ -14,6 +15,8 @@ from typing import Optional, Tuple, List
 from pathlib import Path
 import streamlit as st
 from datetime import datetime, timezone
+
+logger = logging.getLogger("rc_online")
 
 # =====================================================================
 # CONFIGURAÇÕES E CONSTANTES
@@ -69,14 +72,17 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
                 try:
                     arquivo.seek(0)
                     df = pd.read_csv(arquivo, **tent)
-                    if len(df.columns) > 1: return df
-                except: continue
+                    if len(df.columns) > 1:
+                        return df
+                except Exception:
+                    continue
             raise ValueError("Não foi possível ler o CSV.")
             
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
             return pd.read_excel(arquivo)
-    except Exception as e:
-        st.error(f"Erro ao ler arquivo: {e}")
+    except Exception:
+        logger.exception("Falha ao ler arquivo de produtos")
+        st.error("Não foi possível ler o arquivo enviado. Verifique se é um CSV ou Excel (.xls, .xlsx) válido.")
         return None
 
 def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
@@ -164,7 +170,7 @@ def converter_preco(val):
     if ',' in s and '.' in s: s = s.replace('.', '').replace(',', '.')
     elif ',' in s: s = s.replace(',', '.')
     try: return float(s)
-    except: return 0.0
+    except Exception: return 0.0
 
 def processar_arquivo_produtos(arquivo):
     df = ler_arquivo(arquivo)
@@ -330,8 +336,9 @@ def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=
         
         return True, msg
 
-    except Exception as e:
-        return False, f"Erro crítico: {e}"
+    except Exception:
+        logger.exception("Falha crítica ao sincronizar produtos no Supabase")
+        return False, "Não foi possível atualizar a tabela de preços no momento. Confira o arquivo e tente novamente."
 
 
 def recalcular_cotacoes_pendentes(supabase, representante_id):
@@ -441,8 +448,8 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
                 
         return count_atualizadas
 
-    except Exception as e:
-        print(f"Erro ao recalcular pendentes: {e}")
+    except Exception:
+        logger.exception("Falha ao recalcular cotações pendentes")
         return 0
 
 def exibir_preview_dados(df: pd.DataFrame):
