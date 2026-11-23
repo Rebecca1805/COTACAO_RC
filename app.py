@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timezone
 import pandas as pd
@@ -7,6 +8,26 @@ import unicodedata
 from fpdf import FPDF
 import bcrypt
 from supabase import create_client, Client
+
+# =====================================================================
+# CONFIGURAÇÃO DE LOGS (SEG-6)
+# =====================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("rc_online")
+
+def registrar_erro(contexto: str, erro: Exception = None):
+    """
+    Registra o erro técnico completo apenas no terminal/logs do servidor,
+    sem exibir detalhes internos ao usuário e sem incluir dados sensíveis.
+    """
+    if erro is not None:
+        logger.exception(f"Falha em [{contexto}]")
+    else:
+        logger.error(f"Falha em [{contexto}]")
 
 # Importa o módulo de gerenciamento de produtos
 from produtos_manager import (
@@ -34,7 +55,7 @@ def data_brasil(data_iso):
     if isinstance(data_iso, str):
         try:
             dt = pd.to_datetime(data_iso)
-        except:
+        except Exception:
             return data_iso
     else:
         dt = data_iso
@@ -50,6 +71,7 @@ def data_brasil(data_iso):
         dt = dt - pd.Timedelta(hours=3)
         
     return dt
+
 def parse_money(valor):
     """
     Converte string de dinheiro BR (ex: '1.234,56') para float (1234.56).
@@ -97,12 +119,13 @@ def processar_tabela_produtos(arquivo):
             # Tenta ler com diferentes encodings e separadores comuns no Brasil
             try:
                 df = pd.read_csv(arquivo, sep=',', decimal=',', quotechar='"', encoding='utf-8')
-            except:
+            except Exception:
                 try:
                     arquivo.seek(0)
                     df = pd.read_csv(arquivo, sep=';', decimal=',', encoding='latin1')
                 except Exception as e:
-                    st.error(f"Erro ao ler CSV. Verifique se o separador é vírgula ou ponto-e-vírgula. Detalhe: {e}")
+                    registrar_erro("Leitura de CSV na função processar_tabela_produtos", e)
+                    st.error("Não foi possível ler o arquivo CSV. Verifique se o separador é vírgula ou ponto-e-vírgula.")
                     return None
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
             df = pd.read_excel(arquivo)
@@ -111,7 +134,6 @@ def processar_tabela_produtos(arquivo):
             return None
 
         # 2. Padronização dos Nomes das Colunas (Mapa de Correção)
-        # Transforma tudo para minúsculo e remove espaços para comparar
         df.columns = [c.strip().lower() for c in df.columns]
         
         mapa_colunas = {
@@ -119,10 +141,8 @@ def processar_tabela_produtos(arquivo):
             'produto_1': 'produto',
             'unidade_1': 'unidade',
             'entrega_1': 'entrega',
-            # Adicione aqui outras variações se aparecerem
         }
         
-        # Renomeia as colunas erradas para o padrão certo
         df = df.rename(columns=mapa_colunas)
 
         # 3. Validação das Colunas Obrigatórias
@@ -135,19 +155,17 @@ def processar_tabela_produtos(arquivo):
         colunas_preco = [c for c in df.columns if 'preco' in c or c in ['retira', 'entrega']]
         
         for col in colunas_preco:
-            # Função lambda para limpar e converter cada valor
             def limpar_preco(x):
                 if pd.isna(x): return 0.0
                 if isinstance(x, (int, float)): return float(x)
                 
-                # Trata string: remove "R$", espaços, pontos de milhar e troca vírgula por ponto
                 s = str(x).strip().replace('R$', '').replace(' ', '')
                 if ',' in s:
-                    s = s.replace('.', '').replace(',', '.') # Ex: 1.000,50 -> 1000.50
+                    s = s.replace('.', '').replace(',', '.')
                 
                 try:
                     return float(s)
-                except:
+                except Exception:
                     return 0.0
 
             df[col] = df[col].apply(limpar_preco)
@@ -155,9 +173,10 @@ def processar_tabela_produtos(arquivo):
         return df
 
     except Exception as e:
-        st.error(f"Erro crítico ao processar tabela: {str(e)}")
-        return None    
-
+        registrar_erro("Processamento de tabela de produtos", e)
+        st.error("Não foi possível processar a tabela de produtos. Verifique o arquivo e tente novamente.")
+        return None
+    
 # =====================================================================
 # CONFIGURAÇÃO DO SUPABASE
 # =====================================================================
@@ -173,7 +192,8 @@ try:
     
     supabase: Client = create_client(supabase_url, supabase_key)
 except Exception as e:
-    st.error(f"Erro ao conectar com Supabase. Verifique as credenciais em .streamlit/secrets.toml: {e}")
+    registrar_erro("Conexão inicial com o Supabase", e)
+    st.error("⚠️ Não foi possível conectar ao sistema no momento. Tente novamente em instantes ou avise o suporte.")
     st.stop()
 
 # =====================================================================
@@ -333,8 +353,11 @@ def hash_senha(senha):
 
 def verificar_senha(senha, senha_hash):
     """Verifica senha"""
-    try: return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
-    except: return False
+    try:
+        return bcrypt.checkpw(senha.encode('utf-8'), senha_hash.encode('utf-8'))
+    except Exception as e:
+        registrar_erro("Verificação de hash de senha", e)
+        return False
 
 # =====================================================================
 # CONTROLE DE TENTATIVAS DE LOGIN (SEG-4)
@@ -354,8 +377,8 @@ def limpar_tentativas_login(identificador: str, tipo_usuario: str):
             'bloqueado_ate': None,
             'updated_at': datetime.now(timezone.utc).isoformat()
         }).eq('identificador', id_norm).eq('tipo_usuario', tipo_usuario).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        registrar_erro(f"Limpar tentativas de login ({tipo_usuario})", e)
 
 def verificar_bloqueio_login(identificador: str, tipo_usuario: str):
     """
@@ -396,9 +419,65 @@ def verificar_bloqueio_login(identificador: str, tipo_usuario: str):
                 limpar_tentativas_login(id_norm, tipo_usuario)
 
         return False, ""
-    except Exception:
+    except Exception as e:
+        registrar_erro(f"Verificar bloqueio de login ({tipo_usuario})", e)
         return False, ""
 
+def registrar_falha_login(identificador: str, tipo_usuario: str) -> str:
+    """
+    Incrementa tentativas erradas e aplica bloqueio ao atingir o limite.
+    Retorna mensagem informativa para exibir ao usuário.
+    """
+    id_norm = str(identificador).strip().lower()
+    if not id_norm:
+        return "Credenciais inválidas."
+
+    try:
+        resp = (
+            supabase.table('tentativas_login')
+            .select('*')
+            .eq('identificador', id_norm)
+            .eq('tipo_usuario', tipo_usuario)
+            .execute()
+        )
+
+        agora = datetime.now(timezone.utc)
+        tentativas_atuais = 0
+        registro_id = None
+
+        if resp.data:
+            registro = resp.data[0]
+            registro_id = registro['id']
+            tentativas_atuais = int(registro.get('tentativas', 0))
+
+        novas_tentativas = tentativas_atuais + 1
+        bloqueado_ate_iso = None
+
+        if novas_tentativas >= MAX_TENTATIVAS_LOGIN:
+            bloqueado_ate_iso = (agora + pd.Timedelta(minutes=BLOQUEIO_MINUTOS)).isoformat()
+            msg = f"⛔ Muitas tentativas incorretas. Acesso bloqueado por {BLOQUEIO_MINUTOS} minutos."
+        else:
+            restantes = MAX_TENTATIVAS_LOGIN - novas_tentativas
+            msg = f"Senha incorreta. Você tem mais {restantes} tentativa(s) antes do bloqueio temporário."
+
+        payload = {
+            'identificador': id_norm,
+            'tipo_usuario': tipo_usuario,
+            'tentativas': novas_tentativas,
+            'bloqueado_ate': bloqueado_ate_iso,
+            'updated_at': agora.isoformat()
+        }
+
+        if registro_id:
+            supabase.table('tentativas_login').update(payload).eq('id', registro_id).execute()
+        else:
+            supabase.table('tentativas_login').insert(payload).execute()
+
+        return msg
+    except Exception as e:
+        registrar_erro(f"Registrar falha de login ({tipo_usuario})", e)
+        return "Usuário ou senha incorretos."
+    
 def registrar_falha_login(identificador: str, tipo_usuario: str) -> str:
     """
     Incrementa tentativas erradas e aplica bloqueio ao atingir o limite.
@@ -472,7 +551,8 @@ def autenticar_representante(email, senha):
         rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
         limpar_tentativas_login(email_limpo, 'REPRESENTANTE')
         return rep_data.data, "Login realizado com sucesso!"
-    except Exception:
+    except Exception as e:
+        registrar_erro("Autenticação de representante", e)
         msg_falha = registrar_falha_login(email_limpo, 'REPRESENTANTE')
         return None, f"Usuário ou senha incorretos. {msg_falha}"
     
@@ -497,10 +577,11 @@ def criar_representante_admin(nome, email, senha, telefone):
 
         return True, f"Representante '{nome}' cadastrado com sucesso!"
     except Exception as e:
-        return False, f"Erro ao cadastrar representante: {str(e)}"
+        registrar_erro("Cadastro de representante pela administradora", e)
+        return False, "Não foi possível cadastrar o representante. Verifique se o e-mail já não está cadastrado e tente novamente."
 
 # =====================================================================
-# AUTENTICAÇÃO E LÓGICA - CLIENTE (Aqui está a correção!)
+# AUTENTICAÇÃO E LÓGICA - CLIENTE
 # =====================================================================
 
 def autenticar_cliente(identificador, senha):
@@ -529,7 +610,8 @@ def autenticar_cliente(identificador, senha):
         else:
             msg_falha = registrar_falha_login(id_limpo, 'CLIENTE')
             return None, msg_falha
-    except Exception:
+    except Exception as e:
+        registrar_erro("Autenticação de cliente", e)
         return None, "Erro ao validar acesso. Tente novamente."
 
 def ativar_senha_cliente(identificador, nova_senha):
@@ -558,6 +640,7 @@ def ativar_senha_cliente(identificador, nova_senha):
         }).eq('id', cliente['id']).execute()
         return True, "Senha criada com sucesso! Agora acesse a aba 'Já tenho senha' para entrar."
     except Exception as e:
+        registrar_erro("Ativação de senha do cliente", e)
         return False, "Não foi possível ativar a senha no momento. Tente novamente."
 
 # Mantemos estas por compatibilidade caso seu código antigo use
@@ -565,15 +648,19 @@ def buscar_cliente_para_cadastro(identificador):
     id_limpo = so_digitos(identificador)
     try:
         response = supabase.table('clientes').select('*').or_(f"cnpj.eq.{id_limpo},telefone.eq.{id_limpo}").execute()
-        if response.data: return response.data[0], response.data[0]['representante_id']
-    except: pass
+        if response.data:
+            return response.data[0], response.data[0]['representante_id']
+    except Exception as e:
+        registrar_erro("Busca de cliente para cadastro", e)
     return None, None
 
 def criar_senha_cliente(cliente_id, senha):
     try:
         supabase.table('clientes').update({'senha_hash': hash_senha(senha)}).eq('id', cliente_id).execute()
         return True, "Senha criada!"
-    except Exception as e: return False, str(e)
+    except Exception as e:
+        registrar_erro("Criação de senha do cliente", e)
+        return False, "Não foi possível criar a senha. Tente novamente."
 
 # =====================================================================
 # FUNÇÕES DE DADOS - CLIENTES
@@ -585,7 +672,8 @@ def carregar_clientes(representante_id):
         response = supabase.table('clientes').select('*').eq('representante_id', representante_id).execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Erro ao carregar clientes: {e}")
+        registrar_erro("Carregar clientes do representante", e)
+        st.error("Não foi possível carregar a lista de clientes no momento.")
         return pd.DataFrame()
 
 def atualizar_visualiza_preco(cliente_id, pode_ver, representante_id):
@@ -596,7 +684,8 @@ def atualizar_visualiza_preco(cliente_id, pode_ver, representante_id):
         }).eq('id', cliente_id).eq('representante_id', representante_id).execute()
         return True
     except Exception as e:
-        st.error(f"Erro ao atualizar: {e}")
+        registrar_erro("Atualizar permissão de visualização de preço", e)
+        st.error("Não foi possível atualizar a permissão de preços.")
         return False
 
 def upload_clientes_excel(arquivo, representante_id):
@@ -605,14 +694,11 @@ def upload_clientes_excel(arquivo, representante_id):
     """
     try:
         # 0. BUSCAR CLIENTES EXISTENTES (Para resolver conflitos de ID)
-        # Precisamos saber o ID de quem já está cadastrado para forçar atualização
         existing_df = carregar_clientes(representante_id)
         map_cnpj = {}
         map_tel = {}
         
         if not existing_df.empty:
-            # Cria mapas de busca: CNPJ -> ID e Telefone -> ID
-            # Garante que estamos comparando apenas números limpos
             if 'cnpj' in existing_df.columns:
                 for _, row in existing_df.iterrows():
                     c_limpo = so_digitos(str(row['cnpj']))
@@ -655,13 +741,11 @@ def upload_clientes_excel(arquivo, representante_id):
             cnpj_limpo = so_digitos(str(row.get('CNPJ', '')))
             tel_limpo = so_digitos(str(row.get('TELEFONE', '')))
             
-            # --- LÓGICA DE DETECÇÃO DE ID (O Segredo para não dar erro) ---
+            # --- LÓGICA DE DETECÇÃO DE ID ---
             cliente_id = None
             
-            # 1ª Tentativa: Achar pelo CNPJ
             if cnpj_limpo and cnpj_limpo in map_cnpj:
                 cliente_id = map_cnpj[cnpj_limpo]
-            # 2ª Tentativa: Achar pelo Telefone (caso CNPJ seja novo ou vazio)
             elif tel_limpo and tel_limpo in map_tel:
                 cliente_id = map_tel[tel_limpo]
             
@@ -689,7 +773,7 @@ def upload_clientes_excel(arquivo, representante_id):
                         elif dist_val <= 500: coluna_preco = 'preco_acima400km'
                         elif dist_val <= 600: coluna_preco = 'preco_acima500km'
                         else: coluna_preco = 'preco_acima600km'
-                except:
+                except Exception:
                     dist_val = 0
 
             # --- VISUALIZA PREÇO ---
@@ -698,7 +782,6 @@ def upload_clientes_excel(arquivo, representante_id):
             if val_visu in ['não', 'nao', 'n', 'false', '0', 'block']:
                 visualiza = False
             
-            # Monta o objeto do cliente
             cliente_dict = {
                 'representante_id': representante_id,
                 'nome': str(row['NOME']).strip().upper(),
@@ -713,8 +796,6 @@ def upload_clientes_excel(arquivo, representante_id):
             if not cliente_id:
                 cliente_dict['senha_hash'] = None
             
-            # SE ACHAMOS O ID, ADICIONAMOS AO DICIONÁRIO
-            # Isso força o Supabase a fazer UPDATE na linha certa, evitando conflito de chave única
             if cliente_id:
                 cliente_dict['id'] = cliente_id
             
@@ -724,8 +805,6 @@ def upload_clientes_excel(arquivo, representante_id):
             st.warning("Nenhum cliente válido encontrado.")
             return
 
-        # Upsert usando 'id' como chave de conflito. 
-        # Quem tem ID atualiza, quem não tem cria novo.
         supabase.table('clientes').upsert(clientes, on_conflict='id').execute()
         
         st.success(f"✅ Processo finalizado! {len(clientes)} clientes processados.")
@@ -735,7 +814,9 @@ def upload_clientes_excel(arquivo, representante_id):
             st.warning(f"⚠️ Nota: {count_sem_doc} clientes sem CNPJ/Telefone.")
         
     except Exception as e:
-        st.error(f"Erro ao processar planilha: {e}")
+        registrar_erro("Upload de planilha de clientes", e)
+        st.error("Não foi possível importar a planilha de clientes. Verifique se não há CNPJs duplicados ou inválidos e tente novamente.")
+
 
 # =====================================================================
 # FUNÇÕES DE DADOS - PRODUTOS
@@ -747,7 +828,8 @@ def carregar_produtos(representante_id):
         response = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Erro ao carregar produtos: {e}")
+        registrar_erro("Carregar produtos do representante", e)
+        st.error("Não foi possível carregar os produtos no momento.")
         return pd.DataFrame()
     
 @st.cache_data(ttl=300)  # 5 minutos
@@ -798,7 +880,8 @@ def buscar_produtos(representante_id, termo):
         return df_filtrado.head(20)
 
     except Exception as e:
-        st.error(f"Erro ao buscar produtos: {e}")
+        registrar_erro("Buscar produtos no catálogo", e)
+        st.error("Não foi possível realizar a busca de produtos no momento.")
         return pd.DataFrame()
 
 def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
@@ -849,7 +932,8 @@ def upload_tabela_precos_csv(arquivo, representante_id):
             try:
                 df = pd.read_excel(arquivo, dtype=str)
             except Exception as e:
-                st.error(f"Erro ao ler Excel: {e}")
+                registrar_erro("Leitura de Excel na tabela de preços", e)
+                st.error("Não foi possível ler a planilha Excel. Verifique se o arquivo não está corrompido.")
                 return
 
         # Leitura de CSV (.csv) com várias tentativas de codificação
@@ -857,18 +941,16 @@ def upload_tabela_precos_csv(arquivo, representante_id):
             encodings = ['utf-8-sig', 'latin-1', 'cp1252', 'utf-8']
             separadores = [',', ';', '\t']
             
-            # Tenta todas as combinações até conseguir ler
             for enc in encodings:
                 for sep in separadores:
                     try:
                         arquivo.seek(0)
                         temp_df = pd.read_csv(arquivo, sep=sep, encoding=enc, dtype=str, engine='python')
                         
-                        # Se leu e tem mais de 1 coluna, consideramos sucesso
                         if len(temp_df.columns) > 1:
                             df = temp_df
                             break
-                    except:
+                    except Exception:
                         continue
                 if df is not None:
                     break
@@ -882,16 +964,12 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         # ==========================================================
         # 2. MAPA DE COLUNAS FLEXÍVEL (REGEX)
         # ==========================================================
-        # A lógica aqui é: "Se tiver esse pedaço no nome, é essa coluna"
-        # O '.*' significa "qualquer coisa antes ou depois"
         mapa_colunas = {
-            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item', r'cod\.'], # Pega Código_19, Codigo, COD...
-            'Produto': [r'produto', r'descri[cç][aã]o', r'nome', r'material'], # Pega Descrição, Nome do Produto...
+            'Codigo': [r'c[oó]digo', r'ref', r'sku', r'item', r'cod\.'],
+            'Produto': [r'produto', r'descri[cç][aã]o', r'nome', r'material'],
             'Unidade': [r'unidade', r'un\.', r'^un$'], 
             'Retira': [r'retira', r'balc[aã]o', r'loja'],
             'Entrega': [r'entrega', r'cif', r'transp'],
-            
-            # Preços por KM (Procura por números chave no cabeçalho)
             'Preco100a199km': [r'100.*199', r'100.*a.*199'],
             'Preco200a299km': [r'200.*299', r'200.*a.*299'],
             'Preco300a399km': [r'300.*399', r'300.*a.*399'],
@@ -903,19 +981,16 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         colunas_originais = [str(c).strip() for c in df.columns.tolist()]
         colunas_renomeadas = {}
 
-        # Varredura inteligente
         for col_real in colunas_originais:
             col_lower = col_real.lower()
             for coluna_alvo, padroes in mapa_colunas.items():
                 for padrao in padroes:
-                    # Se encontrar o padrão dentro do nome da coluna...
                     if re.search(padrao, col_lower):
                         colunas_renomeadas[col_real] = coluna_alvo
-                        break # Achou, para de testar padrões para este alvo
+                        break
                 if col_real in colunas_renomeadas:
-                    break # Coluna já identificada, vai para a próxima
+                    break
 
-        # Aplica os novos nomes
         df = df.rename(columns=colunas_renomeadas)
         
         # === DIAGNÓSTICO PARA O USUÁRIO ===
@@ -931,7 +1006,6 @@ def upload_tabela_precos_csv(arquivo, representante_id):
                 st.write(colunas_renomeadas)
             return
 
-        # Filtra linhas vazias essenciais
         df = df[(df['Codigo'].notna()) & (df['Codigo'] != '') & (df['Produto'].notna())]
 
         # ==========================================================
@@ -943,32 +1017,28 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         try:
             supabase.table('produtos').delete().eq('representante_id', representante_id).execute()
         except Exception as e:
-            st.error(f"Erro ao limpar tabela antiga: {e}")
+            registrar_erro("Limpar tabela antiga de produtos antes do upload", e)
+            st.error("Não foi possível limpar a tabela anterior. Tente novamente.")
             return
 
         produtos = []
         agora_iso = datetime.now(timezone.utc).isoformat()
         erros_conversao = 0
         
-        # Barra de progresso visual
         progresso_text = "Processando linhas..."
         my_bar = st.progress(0, text=progresso_text)
         total_linhas = len(df)
 
         for idx, row in df.iterrows():
             try:
-                # Atualiza barra a cada 50 linhas para não travar
                 if idx % 50 == 0:
                     my_bar.progress(min(idx / total_linhas, 1.0), text=f"Processando item {idx}/{total_linhas}")
 
                 p = {
                     'representante_id': representante_id,
-                    # Converte para string e remove espaços extras
                     'codigo': str(row.get('Codigo', '')).strip(),
                     'produto': str(row.get('Produto', '')).strip(),
                     'unidade': str(row.get('Unidade', '')).strip() if pd.notna(row.get('Unidade')) else None,
-                    
-                    # Usa a função parse_money para limpar R$, virgulas, etc
                     'preco_retira': parse_money(row.get('Retira')),
                     'preco_entrega': parse_money(row.get('Entrega')), 
                     'preco_100a199km': parse_money(row.get('Preco100a199km')),
@@ -981,21 +1051,21 @@ def upload_tabela_precos_csv(arquivo, representante_id):
                 }
                 produtos.append(p)
             except Exception as e:
-                print(f"Erro linha {idx}: {e}")
+                registrar_erro(f"Conversão de linha na planilha de produtos (linha {idx})", e)
                 erros_conversao += 1
          
         if not produtos:
             st.error("❌ Nenhum produto válido para salvar.")
             return
 
-        # Salva em Lotes de 1000 (mais rápido)
         batch_size = 1000
         for i in range(0, len(produtos), batch_size):
             batch = produtos[i:i + batch_size]
             try:
                 supabase.table('produtos').insert(batch).execute()
             except Exception as e:
-                st.error(f"❌ Erro ao salvar no banco: {e}")
+                registrar_erro("Inserção em lote na tabela de produtos", e)
+                st.error("❌ Não foi possível salvar os produtos no banco de dados. Tente novamente.")
                 break
         
         my_bar.empty()
@@ -1006,7 +1076,9 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         st.balloons()
 
     except Exception as e:
-        st.error(f"❌ Erro crítico no upload: {e}")
+        registrar_erro("Upload geral da tabela de preços CSV/Excel", e)
+        st.error("❌ Não foi possível concluir o envio da tabela de preços. Tente novamente.")
+
 # =====================================================================
 # FUNÇÕES DE DADOS - COTAÇÕES
 # =====================================================================
@@ -1017,7 +1089,8 @@ def carregar_cotacoes(representante_id):
         response = supabase.table('cotacoes').select('*, clientes(nome, telefone)').eq('representante_id', representante_id).order('created_at', desc=True).execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Erro ao carregar cotações: {e}")
+        registrar_erro("Carregar cotações do representante", e)
+        st.error("Não foi possível carregar as cotações no momento.")
         return pd.DataFrame()
 
 def carregar_cotacoes_cliente(cliente_id):
@@ -1026,7 +1099,8 @@ def carregar_cotacoes_cliente(cliente_id):
         response = supabase.table('cotacoes').select('*').eq('cliente_id', cliente_id).order('created_at', desc=True).execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Erro ao carregar cotações: {e}")
+        registrar_erro("Carregar cotações do cliente", e)
+        st.error("Não foi possível carregar seus pedidos no momento.")
         return pd.DataFrame()
 
 def carregar_itens_cotacao(cotacao_id):
@@ -1035,7 +1109,8 @@ def carregar_itens_cotacao(cotacao_id):
         response = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cotacao_id).execute()
         return pd.DataFrame(response.data)
     except Exception as e:
-        st.error(f"Erro ao carregar itens: {e}")
+        registrar_erro("Carregar itens da cotação", e)
+        st.error("Não foi possível carregar os itens desta cotação.")
         return pd.DataFrame()
 
 def gerar_id_cotacao(cliente_nome):
@@ -1049,13 +1124,9 @@ def salvar_cotacao(representante_id, cliente_id, cliente_nome, itens, forma_rece
     Salva cotação e itens no banco
     """
     try:
-        # Calcular total
         total = sum([item['subtotal'] for item in itens])
-        
-        # Gerar ID
         cotacao_id = gerar_id_cotacao(cliente_nome)
         
-        # Inserir cotação
         supabase.table('cotacoes').insert({
             'id': cotacao_id,
             'representante_id': representante_id,
@@ -1067,7 +1138,6 @@ def salvar_cotacao(representante_id, cliente_id, cliente_nome, itens, forma_rece
             'total_final': total
         }).execute()
         
-        # Inserir itens
         itens_para_inserir = []
         for item in itens:
             itens_para_inserir.append({
@@ -1088,7 +1158,8 @@ def salvar_cotacao(representante_id, cliente_id, cliente_nome, itens, forma_rece
         return cotacao_id
         
     except Exception as e:
-        st.error(f"Erro ao salvar cotação: {e}")
+        registrar_erro("Salvar nova cotação", e)
+        st.error("Não foi possível enviar sua cotação no momento. Tente novamente.")
         return None
 
 def atualizar_status_cotacao(cotacao_id, novo_status, representante_id):
@@ -1099,7 +1170,8 @@ def atualizar_status_cotacao(cotacao_id, novo_status, representante_id):
         }).eq('id', cotacao_id).eq('representante_id', representante_id).execute()
         st.success(f"Status atualizado para {novo_status}!")
     except Exception as e:
-        st.error(f"Erro ao atualizar status: {e}")
+        registrar_erro("Atualizar status da cotação", e)
+        st.error("Não foi possível atualizar o status da cotação.")
 
 def aplicar_desconto_geral(cotacao_id, desconto_percentual, representante_id):
     """Aplica desconto geral na cotação garantindo isolamento por representante"""
@@ -1122,7 +1194,8 @@ def aplicar_desconto_geral(cotacao_id, desconto_percentual, representante_id):
 
         st.success(f"Desconto de {desconto_percentual}% aplicado!")
     except Exception as e:
-        st.error(f"Erro ao aplicar desconto: {e}")
+        registrar_erro("Aplicar desconto geral na cotação", e)
+        st.error("Não foi possível aplicar o desconto no momento.")
 
 def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual, representante_id):
     """
@@ -1131,7 +1204,6 @@ def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual
     3. Recalcula o total da cotação e salva no banco
     """
     try:
-        # Trava de isolamento: confirma posse da cotação antes de alterar itens
         check = (
             supabase.table('cotacoes')
             .select('id')
@@ -1168,7 +1240,8 @@ def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual
 
         return True
     except Exception as e:
-        st.error(f"Erro ao recalcular: {e}")
+        registrar_erro("Recalcular e salvar itens da cotação", e)
+        st.error("Não foi possível salvar os valores recalculados. Tente novamente.")
         return False
 
 # =====================================================================
@@ -1194,14 +1267,10 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
         if not cotacao:
             return b''
 
-        # Buscar itens
         itens_response = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cotacao_id).execute()
         itens = itens_response.data
-        
-        # Dados do cliente
         cliente = cotacao.get('clientes', {})
         
-        # Gerar PDF
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font('Arial', 'B', 14)
@@ -1216,34 +1285,27 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
         
         pdf.ln(4)
         
-        # --- BLOCO DE TOTAIS MELHORADO ---
         if mostrar_precos:
-            # Pegamos os valores do banco
             total_final = float(cotacao.get('total_final', 0))
-            soma_subtotais = float(cotacao.get('total_original', 0)) # Subtotais já com desc item
+            soma_subtotais = float(cotacao.get('total_original', 0))
             desconto_extra_pct = float(cotacao.get('desconto_geral_percentual', 0))
             
-            # Recalcular o Bruto Real (Preço Cheio * Qtd) iterando itens
             total_bruto_real = 0.0
             for item in itens:
                 p = float(item.get('preco_unitario', 0))
                 q = float(item.get('quantidade', 0))
                 total_bruto_real += (p * q)
             
-            # Calcular os descontos em Reais
             total_desc_itens = total_bruto_real - soma_subtotais
             total_desc_extra = soma_subtotais - total_final
             
-            # 1. Total Real (Bruto)
             pdf.cell(0, 8, f"Total Real (Sem descontos): R$ {total_bruto_real:.2f}", ln=True)
             
-            # 2. Desconto nos Itens (Se houver)
             if total_desc_itens > 0.01:
                 pdf.set_text_color(200, 0, 0)
                 pdf.cell(0, 8, f"Desconto nos Itens: - R$ {total_desc_itens:.2f}", ln=True)
                 pdf.set_text_color(0, 0, 0)
                 
-            # 3. Desconto Extra (Se houver)
             if total_desc_extra > 0.01:
                 pdf.set_text_color(200, 0, 0)
                 msg_extra = f"Desconto Extra: - R$ {total_desc_extra:.2f}"
@@ -1252,7 +1314,6 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
                 pdf.cell(0, 8, msg_extra, ln=True)
                 pdf.set_text_color(0, 0, 0)
             
-            # 4. Total Final em Negrito
             pdf.ln(2)
             pdf.set_font('Arial', 'B', 12)
             pdf.cell(0, 10, f"TOTAL FINAL: R$ {total_final:.2f}", ln=True)
@@ -1260,11 +1321,9 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
             
         else:
             pdf.cell(0, 8, "Valores a serem informados pelo representante.", ln=True)
-        # ---------------------------------
         
         pdf.ln(4)
         
-        # Cabeçalho da tabela
         pdf.set_font('Arial', 'B', 10)
         pdf.cell(25, 8, 'Cod.', border=1)
         pdf.cell(75, 8, 'Produto', border=1)
@@ -1277,7 +1336,6 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
         else:
             pdf.cell(55, 8, 'Precos a informar', border=1, ln=True)
         
-        # Itens
         pdf.set_font('Arial', '', 9)
         for item in itens:
             pdf.cell(25, 6, str(item.get('codigo', ''))[:10], border=1)
@@ -1301,9 +1359,10 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
         return pdf.output(dest='S').encode('latin-1')
         
     except Exception as e:
-        st.error(f"Erro ao gerar PDF: {e}")
+        registrar_erro("Gerar PDF da cotação", e)
+        st.error("Não foi possível gerar o PDF desta cotação no momento.")
         return b''
-
+    
 # =====================================================================
 # PÁGINAS DA APLICAÇÃO - REPRESENTANTE
 # =====================================================================
@@ -1516,9 +1575,9 @@ def pagina_upload_tabela_precos(representante_id):
                         time.sleep(1)
                         st.rerun()
                     else:
-                        st.error("Não consegui atualizar a tabela. Confere o arquivo e tenta novamente.")
-                        with st.expander("🔍 Detalhes (para suporte)", expanded=False):
-                            st.write(mensagem)
+                        logger.error(f"Falha ao sincronizar tabela de preços: {mensagem}")
+                        st.error("Não foi possível atualizar a tabela de preços. Confira o arquivo e tente novamente.")
+
 
 def pagina_upload_clientes(representante_id):
     """Página para upload de clientes"""
@@ -1601,9 +1660,9 @@ def pagina_upload_clientes(representante_id):
                     st.rerun()
                     
         except Exception as e:
-            st.error(f"Erro ao processar arquivo: {e}")
-            st.info("Verifique se o arquivo está no formato correto (Excel .xlsx)")
-
+            registrar_erro("Pré-visualização do arquivo de clientes", e)
+            st.error("Não foi possível ler o arquivo enviado. Verifique se está no formato correto (Excel .xlsx).")
+            
 def pagina_gestao_clientes(representante_id):
     """Página de gestão de clientes (Cadastro e Edição)"""
     st.subheader("👥 Gestão de Clientes")
@@ -1664,8 +1723,8 @@ def pagina_gestao_clientes(representante_id):
                         st.success(f"✅ Cliente {nome_novo} cadastrado! Ele já pode criar sua própria senha no 1º acesso.")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Erro ao cadastrar: {e}. Verifique se o CNPJ já não existe.")
-
+                        registrar_erro("Cadastro manual de cliente", e)
+                        st.error("Não foi possível cadastrar o cliente. Verifique se o CNPJ já não existe ou tente novamente.")
     st.markdown("---")
     
     # =========================================================
@@ -1742,9 +1801,9 @@ def pagina_gestao_clientes(representante_id):
                         }).eq('id', row['id']).eq('representante_id', representante_id).execute()
                         
                         st.success(f"Senha de {row['nome']} limpa! O cliente já pode cadastrar uma nova senha no 1º acesso.")
-                    except Exception:
-                        st.error("Erro ao resetar senha.")
-            
+                    except Exception as e:
+                        registrar_erro("Reset de senha do cliente", e)
+                        st.error("Não foi possível resetar a senha no momento. Tente novamente.")
             st.markdown("---")
 
 def pagina_gerenciar_cotacoes(representante_id):
@@ -1969,7 +2028,8 @@ def pagina_administradora():
         else:
             st.info("Nenhum representante cadastrado.")
     except Exception as e:
-        st.error(f"Erro ao listar representantes: {e}")
+        registrar_erro("Listar representantes na área da administradora", e)
+        st.error("Não foi possível carregar a lista de representantes no momento.")
 
 
 def pagina_representante():
@@ -2480,8 +2540,9 @@ def pagina_cliente():
             else:
                 st.session_state.cliente_logado = None
                 st.rerun()
-        except:
-            pass 
+        except Exception as e:
+            registrar_erro("Verificação de sessão do cliente", e)
+
 
     # --- TELA DE LOGIN / PRIMEIRO ACESSO ---
     if st.session_state.cliente_logado is None:
