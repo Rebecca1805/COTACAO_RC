@@ -1,3 +1,4 @@
+import html
 import logging
 import os
 from datetime import datetime, timezone
@@ -335,6 +336,12 @@ def so_digitos(valor):
     if pd.isna(valor): return ""
     return re.sub(r'\D', '', str(valor))
 
+def escapar_html(valor) -> str:
+    """Escapa caracteres especiais HTML (<, >, &, ", ') vindos de texto digitado ou do banco."""
+    if valor is None or pd.isna(valor):
+        return ""
+    return html.escape(str(valor), quote=True)
+
 def parse_preco(valor):
     """(Alias para manter compatibilidade)"""
     return parse_money(valor)
@@ -557,29 +564,48 @@ def autenticar_representante(email, senha):
         return None, f"Usuário ou senha incorretos. {msg_falha}"
     
 def criar_representante_admin(nome, email, senha, telefone):
-    """Cria representante via API administrativa do Supabase (funciona com cadastro público desligado)"""
+    """Cria representante via API administrativa do Supabase com troca obrigatória de senha no 1º acesso (SEG-12)"""
     try:
-        # 1. Cria o usuário no Supabase Auth usando permissão administrativa (service_role)
-        response = supabase.auth.admin.create_user({
+        # Cria cliente limpo com a chave administrativa para não sofrer interferência de logins anteriores
+        admin_client = create_client(supabase_url, supabase_key)
+        response = admin_client.auth.admin.create_user({
             "email": email.strip(),
             "password": senha,
             "email_confirm": True
         })
         user_id = response.user.id
 
-        # 2. Insere o perfil na tabela representantes
+        # Insere o perfil na tabela representantes exigindo troca de senha no 1º acesso
         supabase.table('representantes').insert({
             'id': user_id,
             'nome': nome.strip(),
             'email': email.strip(),
-            'telefone': so_digitos(telefone) if telefone else None
+            'telefone': so_digitos(telefone) if telefone else None,
+            'trocar_senha': True
         }).execute()
 
-        return True, f"Representante '{nome}' cadastrado com sucesso!"
+        return True, f"Representante '{nome}' cadastrado com sucesso! Ele deverá trocar a senha no primeiro acesso."
     except Exception as e:
         registrar_erro("Cadastro de representante pela administradora", e)
         return False, "Não foi possível cadastrar o representante. Verifique se o e-mail já não está cadastrado e tente novamente."
 
+def atualizar_senha_representante(user_id: str, nova_senha: str):
+    """Atualiza a senha no Supabase Auth e libera o acesso do representante (SEG-12)"""
+    try:
+        # Cria cliente limpo com a chave administrativa para garantir permissão de troca
+        admin_client = create_client(supabase_url, supabase_key)
+        admin_client.auth.admin.update_user_by_id(
+            str(user_id).strip(),
+            {"password": nova_senha}
+        )
+        supabase.table('representantes').update({
+            'trocar_senha': False
+        }).eq('id', user_id).execute()
+        return True, "Senha atualizada com sucesso!"
+    except Exception as e:
+        registrar_erro("Troca de senha no primeiro acesso do representante", e)
+        return False, "Não foi possível atualizar sua senha no momento. Tente novamente."
+    
 # =====================================================================
 # AUTENTICAÇÃO E LÓGICA - CLIENTE
 # =====================================================================
@@ -1868,15 +1894,15 @@ def pagina_gerenciar_cotacoes(representante_id):
                 st.markdown(f"**Entrega:** {cot.get('forma_recebimento', 'N/A')}")
             
             with col2:
-                # --- VISUALIZAÇÃO SOLICITADA ---
+                # --- VISUALIZAÇÃO SOLICITADA (SEG-7: valores sanitizados) ---
                 st.metric("Total Final", f"R$ {total_final:,.2f}")
+                desc_geral_pct = float(cot.get('desconto_geral_percentual') or 0)
                 
-                # Exibição detalhada em HTML pequeno ou Caption
                 st.markdown(f"""
                 <div style="font-size: 12px; color: #555;">
                 <b>Total Real (Sem descontos):</b> R$ {total_real_bruto:,.2f}<br>
                 <span style="color: #d9534f;">▼ Desc. nos Itens: R$ {total_desc_itens:,.2f}</span><br>
-                <span style="color: #d9534f;">▼ Desc. Extra ({cot.get('desconto_geral_percentual', 0)}%): R$ {total_desc_extra:,.2f}</span>
+                <span style="color: #d9534f;">▼ Desc. Extra ({escapar_html(f"{desc_geral_pct:g}")}%): R$ {total_desc_extra:,.2f}</span>
                 </div>
                 """, unsafe_allow_html=True)
                 # -------------------------------
@@ -2068,6 +2094,49 @@ def pagina_representante():
     # Representante logado
     rep = st.session_state.representante_logado
     representante_id = rep['id']
+
+    # =========================================================
+    # TRAVA DE PRIMEIRO ACESSO (SEG-12)
+    # =========================================================
+    if rep.get('trocar_senha', False):
+        st.sidebar.title(f"Olá, {rep.get('nome', 'Representante')}!")
+        if st.sidebar.button("Sair"):
+            st.session_state.representante_logado = None
+            st.rerun()
+
+        col_esq, col_centro, col_dir = st.columns([1, 2, 1])
+        with col_centro:
+            st.markdown('<div class="main-header">Primeiro Acesso</div>', unsafe_allow_html=True)
+            st.warning("🔐 Por segurança, você precisa criar uma senha pessoal antes de acessar o painel.")
+
+            with st.form("form_troca_senha_primeiro_acesso"):
+                senha_provisoria_atual = st.text_input("Senha Provisória Atual", type="password")
+                nova_senha = st.text_input("Nova Senha Pessoal (mínimo 6 caracteres)", type="password")
+                confirma_nova_senha = st.text_input("Confirme a Nova Senha Pessoal", type="password")
+
+                if st.form_submit_button("SALVAR NOVA SENHA E ENTRAR", type="primary", width="stretch"):
+                    if not (senha_provisoria_atual and nova_senha and confirma_nova_senha):
+                        st.error("❌ Preencha todos os campos.")
+                    elif len(nova_senha) < 6:
+                        st.error("❌ A nova senha deve ter pelo menos 6 caracteres.")
+                    elif nova_senha == senha_provisoria_atual:
+                        st.error("❌ A nova senha precisa ser diferente da senha provisória.")
+                    elif nova_senha != confirma_nova_senha:
+                        st.error("❌ A confirmação da nova senha não coincide.")
+                    else:
+                        usuario_ok, _ = autenticar_representante(rep.get('email', ''), senha_provisoria_atual)
+                        if usuario_ok is None:
+                            st.error("❌ A senha provisória atual está incorreta.")
+                        else:
+                            sucesso, msg = atualizar_senha_representante(representante_id, nova_senha)
+                            if sucesso:
+                                st.session_state.representante_logado['trocar_senha'] = False
+                                st.success("✅ Senha definida com sucesso! Liberando seu painel...")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {msg}")
+        return
+    # =========================================================
     
     st.sidebar.title(f"Olá, {rep.get('nome', 'Representante')}!")
     menu = st.sidebar.radio(
