@@ -35,6 +35,7 @@ def registrar_erro(contexto: str, erro: Exception = None):
 from produtos_manager import (
     processar_arquivo_produtos,
     sincronizar_produtos_supabase,
+    calcular_impacto_sincronizacao,
     exibir_preview_dados,
     ler_arquivo,
     normalizar_colunas,
@@ -1029,7 +1030,6 @@ def upload_tabela_precos_csv(arquivo, representante_id):
         st.success(f"✅ Tabela atualizada! {len(produtos)} produtos cadastrados.")
         if erros_conversao > 0:
             st.warning(f"⚠️ {erros_conversao} linhas ignoradas por erro de formatação.")
-        st.balloons()
 
     except Exception as e:
         registrar_erro("Upload geral da tabela de preços CSV/Excel", e)
@@ -1425,6 +1425,14 @@ def pagina_upload_tabela_precos(representante_id):
     """Página para upload da tabela de preços com validação robusta"""
     st.subheader("📤 Gerenciar Tabela de Preços")
 
+    # Exibe mensagem salva antes do rerun (não some em 2 segundos)
+    feedback_sync = st.session_state.pop("feedback_sincronizacao", None)
+    if feedback_sync:
+        nivel, texto = feedback_sync
+        if nivel == "warning":
+            st.warning(texto)
+        else:
+            st.success(texto)
     # ========== STATUS ATUAL ==========
     produtos = carregar_produtos(representante_id)
 
@@ -1499,11 +1507,29 @@ def pagina_upload_tabela_precos(representante_id):
             # Resumo/preview da tabela carregada
             exibir_preview_dados(df_processado)
 
-            # Alerta no lugar certo (perto do botão)
+           # Alerta no lugar certo (perto do botão)
             st.warning(
                 "⚠️ Ao atualizar, a tabela ativa passa a ser a do arquivo enviado. "
                 "Itens que não existirem mais no arquivo serão removidos da tabela do dia."
             )
+
+            # Calcula impacto real por código ANTES de liberar o botão
+            impacto = calcular_impacto_sincronizacao(supabase, df_processado, representante_id)
+            exige_confirmacao = impacto['exige_confirmacao']
+            confirmou_exclusao = False
+
+            if exige_confirmacao:
+                st.error(
+                    f"🚨 Atenção: **{impacto['qtd_removiveis']}** de **{impacto['total_atual']}** produtos atuais "
+                    "serão removidos do catálogo (mais de 50%)."
+                )
+                confirmou_exclusao = st.checkbox(
+                    f"Confirmo a remoção de {impacto['qtd_removiveis']} produtos do catálogo",
+                    value=False,
+                    key="chk_confirmar_reducao_catalogo"
+                )
+
+            pode_sincronizar = (not exige_confirmacao) or confirmou_exclusao
 
             # ========== CONFIRMAÇÃO ==========
             st.markdown("---")
@@ -1513,26 +1539,29 @@ def pagina_upload_tabela_precos(representante_id):
                 st.write("")
 
             with col2:
-                if st.button("🚀 Atualizar Dados", type="primary", key="btn_sincronizar"):
+                if st.button(
+                    "🚀 Atualizar Dados",
+                    type="primary",
+                    key="btn_sincronizar",
+                    disabled=not pode_sincronizar
+                ):
                     with st.spinner("⏳ Sincronizando produtos..."):
-                        sucesso, mensagem = sincronizar_produtos_supabase(
+                        sucesso, mensagem, nivel = sincronizar_produtos_supabase(
                             supabase=supabase,
                             df=df_processado,
                             tabela='produtos',
                             limpar_antes=True,
-                            representante_id=representante_id
+                            representante_id=representante_id,
+                            confirmar_exclusao_em_massa=confirmou_exclusao
                         )
 
                     if sucesso:
-                        st.success(mensagem)
-                        st.balloons()
+                        st.session_state["feedback_sincronizacao"] = (nivel, mensagem)
                         st.session_state['recarregar_pagina'] = True
-                        import time
-                        time.sleep(1)
                         st.rerun()
                     else:
                         logger.error(f"Falha ao sincronizar tabela de preços: {mensagem}")
-                        st.error("Não foi possível atualizar a tabela de preços. Confira o arquivo e tente novamente.")
+                        st.error(mensagem)
 
 
 def pagina_upload_clientes(representante_id):
@@ -1605,7 +1634,6 @@ def pagina_upload_clientes(representante_id):
                 if st.button("✅ Confirmar e Salvar Clientes", type="primary", key="btn_confirmar_clientes"):
                     arquivo_upload.seek(0)
                     upload_clientes_excel(arquivo_upload, representante_id)
-                    st.balloons()
                     # Pequeno delay para garantir que deu tempo de ver a mensagem
                     import time
                     time.sleep(2)
@@ -1934,7 +1962,10 @@ def pagina_administradora():
                         st.error(msg_bloqueio)
                     else:
                         senha_correta = st.secrets.get("ADMIN_PASSWORD", "")
-                        if senha_correta and hmac.compare_digest(str(senha_admin), str(senha_correta)):
+                        if senha_correta and hmac.compare_digest(
+                            str(senha_admin).encode("utf-8"),
+                            str(senha_correta).encode("utf-8")
+                        ):
                             limpar_tentativas_login("admin_principal", "ADMIN")
                             st.session_state.admin_logada = True
                             st.rerun()

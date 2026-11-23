@@ -61,12 +61,11 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
     try:
         nome_arquivo = arquivo.name.lower()
         if nome_arquivo.endswith('.csv'):
-            # Tenta diferentes configurações de CSV
             tentativas = [
-                {'sep': ',', 'encoding': 'utf-8', 'decimal': '.'},
-                {'sep': ',', 'encoding': 'latin1', 'decimal': ','},
-                {'sep': ';', 'encoding': 'utf-8', 'decimal': ','},
-                {'sep': ';', 'encoding': 'latin1', 'decimal': ','},
+                {'sep': ',', 'encoding': 'utf-8', 'dtype': str},
+                {'sep': ',', 'encoding': 'latin1', 'dtype': str},
+                {'sep': ';', 'encoding': 'utf-8', 'dtype': str},
+                {'sep': ';', 'encoding': 'latin1', 'dtype': str},
             ]
             for tent in tentativas:
                 try:
@@ -79,7 +78,8 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
             raise ValueError("Não foi possível ler o CSV.")
             
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
-            return pd.read_excel(arquivo)
+            arquivo.seek(0)
+            return pd.read_excel(arquivo, dtype=str)
     except Exception:
         logger.exception("Falha ao ler arquivo de produtos")
         st.error("Não foi possível ler o arquivo enviado. Verifique se é um CSV ou Excel (.xls, .xlsx) válido.")
@@ -146,15 +146,28 @@ def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return len(faltando) == 0, msgs
 
 def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
-    # Remove linhas vazias
-    df = df.dropna(how='all')
+    # Remove linhas totalmente vazias
+    df = df.dropna(how='all').copy()
     
-    # Garante código como string e remove vazios
+    # Garante código como string limpa e remove vazios / 'nan'
     if 'codigo' in df.columns:
-        df['codigo'] = df['codigo'].astype(str).str.strip()
-        df = df[df['codigo'] != '']
-        # Remove duplicatas de código no arquivo (mantém o último ou primeiro)
+        df['codigo'] = df['codigo'].fillna('').astype(str).str.strip()
+        df = df[
+            (df['codigo'] != '') &
+            (df['codigo'].str.lower() != 'nan') &
+            (df['codigo'].str.lower() != 'none')
+        ]
+        # Remove duplicatas de código no arquivo (mantém o último)
         df = df.drop_duplicates(subset=['codigo'], keep='last')
+
+    # Garante que produto também não esteja vazio
+    if 'produto' in df.columns:
+        df['produto'] = df['produto'].fillna('').astype(str).str.strip()
+        df = df[
+            (df['produto'] != '') &
+            (df['produto'].str.lower() != 'nan') &
+            (df['produto'].str.lower() != 'none')
+        ]
 
     # Trata preços
     cols_preco = [c for c in df.columns if 'preco' in c]
@@ -182,29 +195,133 @@ def processar_arquivo_produtos(arquivo):
     if not valido:
         for m in msgs: st.error(m)
         return None
+
+    df_limpo = limpar_dados(df)
+    if df_limpo.empty:
+        st.error("❌ O arquivo enviado não possui produtos válidos (verifique se as colunas Código e Produto estão preenchidas).")
+        return None
         
-    return limpar_dados(df)
+    return df_limpo
 
 # =====================================================================
 # SINCRONIZAÇÃO E RECÁLCULO (LÓGICA NOVA)
 # =====================================================================
 
-def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=False, representante_id=None):
+def calcular_impacto_sincronizacao(supabase, df: pd.DataFrame, representante_id: str, tabela: str = 'produtos') -> dict:
     """
-    1. Atualiza/Insere produtos novos (Upsert).
-    2. Remove produtos antigos que NÃO estão no arquivo, EXCETO se estiverem em cotações APROVADA/CANCELADA.
-    3. Chama a função para atualizar preços das cotações PENDENTES.
+    Calcula quantos produtos atuais serão removidos (excluindo os protegidos por histórico)
+    ANTES de qualquer escrita no banco.
     """
+    all_prods = (
+        supabase.table(tabela)
+        .select('id, codigo')
+        .eq('representante_id', representante_id)
+        .execute()
+        .data
+    ) or []
+
+    total_atual = len(all_prods)
+    if total_atual == 0 or df is None or df.empty:
+        return {
+            'total_atual': total_atual,
+            'ids_final_delete': [],
+            'qtd_removiveis': 0,
+            'qtd_preservados': 0,
+            'exige_confirmacao': False,
+        }
+
+    codigos_novos = set(df['codigo'].astype(str).tolist())
+    ids_candidatos_exclusao = [p['id'] for p in all_prods if str(p['codigo']) not in codigos_novos]
+
+    if not ids_candidatos_exclusao:
+        return {
+            'total_atual': total_atual,
+            'ids_final_delete': [],
+            'qtd_removiveis': 0,
+            'qtd_preservados': 0,
+            'exige_confirmacao': False,
+        }
+
+    cot_protegidas = (
+        supabase.table('cotacoes')
+        .select('id')
+        .neq('status', 'PENDENTE')
+        .eq('representante_id', representante_id)
+        .execute()
+        .data
+    ) or []
+
+    ids_cot_protegidas = [c['id'] for c in cot_protegidas]
+    ids_produtos_protegidos = set()
+
+    if ids_cot_protegidas:
+        for i in range(0, len(ids_candidatos_exclusao), 100):
+            lote_prod = ids_candidatos_exclusao[i:i+100]
+            resp = (
+                supabase.table('cotacao_itens')
+                .select('produto_id')
+                .in_('produto_id', lote_prod)
+                .in_('cotacao_id', ids_cot_protegidas)
+                .execute()
+            )
+            for item in (resp.data or []):
+                ids_produtos_protegidos.add(item['produto_id'])
+
+    ids_final_delete = [id_ for id_ in ids_candidatos_exclusao if id_ not in ids_produtos_protegidos]
+    qtd_removiveis = len(ids_final_delete)
+    exige_confirmacao = (qtd_removiveis / total_atual) > 0.5
+
+    return {
+        'total_atual': total_atual,
+        'ids_final_delete': ids_final_delete,
+        'qtd_removiveis': qtd_removiveis,
+        'qtd_preservados': len(ids_produtos_protegidos),
+        'exige_confirmacao': exige_confirmacao,
+    }
+
+
+def sincronizar_produtos_supabase(
+    supabase,
+    df,
+    tabela='produtos',
+    limpar_antes=False,
+    representante_id=None,
+    confirmar_exclusao_em_massa=False
+):
+    """
+    1. Valida impacto antes de qualquer alteração no banco.
+    2. Atualiza/Insere produtos novos (Upsert).
+    3. Remove produtos antigos que NÃO estão no arquivo, EXCETO se estiverem em cotações APROVADA/CANCELADA.
+    4. Atualiza preços das cotações PENDENTES.
+    Retorna (sucesso: bool, mensagem: str, nivel: 'success' | 'warning' | 'error').
+    """
+    progresso = None
     try:
-        if not representante_id: return False, "ID do representante não fornecido."
-        
+        if not representante_id:
+            return False, "ID do representante não fornecido.", "error"
+
+        if df is None or df.empty:
+            return False, "O arquivo enviado não contém produtos válidos. Nenhuma alteração foi feita no catálogo.", "error"
+
+        # ---------------------------------------------------------
+        # 0. TRAVA DE SEGURANÇA ANTES DE QUALQUER GRAVAÇÃO
+        # ---------------------------------------------------------
+        impacto = calcular_impacto_sincronizacao(supabase, df, representante_id, tabela=tabela)
+        if impacto['exige_confirmacao'] and not confirmar_exclusao_em_massa:
+            return (
+                False,
+                f"Operação bloqueada: {impacto['qtd_removiveis']} de {impacto['total_atual']} produtos ativos seriam removidos. "
+                "Marque a caixa de confirmação para continuar.",
+                "error",
+            )
+
+        df = df.copy()
         df['representante_id'] = representante_id
         df['updated_at'] = datetime.now(timezone.utc).isoformat()
         
         # ---------------------------------------------------------
         # 1. UPSERT (Atualiza a base com a tabela nova)
         # ---------------------------------------------------------
-        # Mantém apenas colunas que existem na tabela produtos
         colunas_validas = {
             'representante_id', 'codigo', 'produto', 'unidade',
             'preco_retira', 'preco_entrega',
@@ -215,12 +332,10 @@ def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=
         df = df[[c for c in df.columns if c in colunas_validas]].copy()
         records = df.to_dict('records')
         
-        # Trata valores NaN para None (JSON null)
         for r in records:
             for k, v in r.items():
                 if pd.isna(v): r[k] = None
                 
-        # Envia em lotes
         batch_size = 100
         progresso = st.progress(0, text="Atualizando catálogo...")
         
@@ -232,123 +347,78 @@ def sincronizar_produtos_supabase(supabase, df, tabela='produtos', limpar_antes=
         # ---------------------------------------------------------
         # 2. LIMPEZA (Substituição Inteligente)
         # ---------------------------------------------------------
-        # Queremos apagar tudo que NÃO está no arquivo novo,
-        # MAS preservar o que é usado em histórico (Aprovada/Cancelada).
-        
-        codigos_novos = set(df['codigo'].astype(str).tolist())
-        
-        # Busca todos os produtos do banco
-        all_prods = supabase.table(tabela).select('id, codigo').eq('representante_id', representante_id).execute().data
-        
-        # Identifica quem sumiu do arquivo
-        ids_candidatos_exclusao = [p['id'] for p in all_prods if str(p['codigo']) not in codigos_novos]
-        
+        ids_final_delete = impacto['ids_final_delete']
+        qtd_preservados = impacto['qtd_preservados']
         qtd_removidos = 0
-        qtd_preservados = 0
         
-        if ids_candidatos_exclusao:
-            progresso.progress(0.85, text="Verificando integridade do histórico...")
-            
-            # Verifica quais desses IDs são usados em cotações "protegidas" (Aprovada/Cancelada)
-            # Para isso, precisamos fazer um join ou duas queries. Vamos por queries.
-            
-            # Passo A: Busca IDs de cotações que NÃO são pendentes
-            cot_protegidas = supabase.table('cotacoes')\
-                .select('id')\
-                .neq('status', 'PENDENTE')\
-                .eq('representante_id', representante_id)\
-                .execute().data
-            
-            ids_cot_protegidas = [c['id'] for c in cot_protegidas]
-            
-            ids_produtos_protegidos = set()
-            
-            if ids_cot_protegidas:
-                # Passo B: Busca itens dessas cotações que contêm os produtos candidatos
-                # Fazemos em lotes para não estourar a URL
-                for i in range(0, len(ids_candidatos_exclusao), 100):
-                    lote_prod = ids_candidatos_exclusao[i:i+100]
-                    
-                    # Se o produto está num item de cotação protegida
-                    resp = supabase.table('cotacao_itens')\
-                        .select('produto_id')\
-                        .in_('produto_id', lote_prod)\
-                        .in_('cotacao_id', ids_cot_protegidas)\
-                        .execute()
-                    
-                    for item in resp.data:
-                        ids_produtos_protegidos.add(item['produto_id'])
-            
-            # Passo C: Define quem roda (Quem sumiu do arquivo E NÃO é protegido)
-            # Obs: Se o produto estava só em PENDENTE, ele será apagado (e a cotação pendente perde o item, o que é correto)
-            ids_final_delete = [id_ for id_ in ids_candidatos_exclusao if id_ not in ids_produtos_protegidos]
-            qtd_preservados = len(ids_produtos_protegidos)
-            
-            # Passo D: Deleta
-            if ids_final_delete:
-                # 1) Buscar cotações pendentes do representante
-                cot_pend = (
-                    supabase.table('cotacoes')
-                    .select('id')
-                    .eq('representante_id', representante_id)
-                    .eq('status', 'PENDENTE')
-                    .execute()
-                    .data
-                )
-                ids_cot_pend = [c['id'] for c in cot_pend] if cot_pend else []
+        if ids_final_delete:
+            progresso.progress(0.85, text="Removendo itens fora de linha...")
+            cot_pend = (
+                supabase.table('cotacoes')
+                .select('id')
+                .eq('representante_id', representante_id)
+                .eq('status', 'PENDENTE')
+                .execute()
+                .data
+            ) or []
+            ids_cot_pend = [c['id'] for c in cot_pend]
 
-                # 2) Antes de deletar produtos, deletar itens de cotações PENDENTES que apontam pra eles
-                if ids_cot_pend:
-                    for i in range(0, len(ids_final_delete), 100):
-                        lote_prod = ids_final_delete[i:i+100]
-
-                        for j in range(0, len(ids_cot_pend), 100):
-                            lote_cot = ids_cot_pend[j:j+100]
-
-                            (
-                                supabase.table('cotacao_itens')
-                                .delete()
-                                .in_('produto_id', lote_prod)
-                                .in_('cotacao_id', lote_cot)
-                                .execute()
-                            )
-
-                # 3) Agora sim, deletar os produtos do catálogo (em lotes)
+            if ids_cot_pend:
                 for i in range(0, len(ids_final_delete), 100):
-                    lote_del = ids_final_delete[i:i+100]
-                    supabase.table(tabela).delete().in_('id', lote_del).execute()
+                    lote_prod = ids_final_delete[i:i+100]
+                    for j in range(0, len(ids_cot_pend), 100):
+                        lote_cot = ids_cot_pend[j:j+100]
+                        (
+                            supabase.table('cotacao_itens')
+                            .delete()
+                            .in_('produto_id', lote_prod)
+                            .in_('cotacao_id', lote_cot)
+                            .execute()
+                        )
 
-                qtd_removidos = len(ids_final_delete)
+            for i in range(0, len(ids_final_delete), 100):
+                lote_del = ids_final_delete[i:i+100]
+                supabase.table(tabela).delete().in_('id', lote_del).execute()
 
+            qtd_removidos = len(ids_final_delete)
 
         # ---------------------------------------------------------
         # 3. RECÁLCULO DE COTAÇÕES PENDENTES
         # ---------------------------------------------------------
         progresso.progress(0.9, text="Atualizando preços das cotações pendentes...")
-        qtd_cotacoes_atualizadas = recalcular_cotacoes_pendentes(supabase, representante_id)
+        qtd_cotacoes_atualizadas, recalculo_ok = recalcular_cotacoes_pendentes(supabase, representante_id)
         
-        progresso.empty()
+        if progresso:
+            progresso.empty()
         
         msg = f"✅ Sucesso! {len(records)} produtos ativos."
-        if qtd_removidos > 0: msg += f" 🗑️ {qtd_removidos} fora de linha removidos."
-        if qtd_preservados > 0: msg += f" 🛡️ {qtd_preservados} antigos mantidos por histórico."
-        if qtd_cotacoes_atualizadas > 0: msg += f" 🔄 {qtd_cotacoes_atualizadas} cotações pendentes atualizadas."
+        if qtd_removidos > 0:
+            msg += f" 🗑️ {qtd_removidos} fora de linha removidos."
+        if qtd_preservados > 0:
+            msg += f" 🛡️ {qtd_preservados} antigos mantidos por histórico."
+
+        if not recalculo_ok:
+            msg += " ⚠️ Tabela atualizada, mas não foi possível recalcular as cotações pendentes automaticamente."
+            return True, msg, "warning"
+
+        if qtd_cotacoes_atualizadas > 0:
+            msg += f" 🔄 {qtd_cotacoes_atualizadas} cotações pendentes atualizadas."
         
-        return True, msg
+        return True, msg, "success"
 
     except Exception:
+        if progresso:
+            progresso.empty()
         logger.exception("Falha crítica ao sincronizar produtos no Supabase")
-        return False, "Não foi possível atualizar a tabela de preços no momento. Confira o arquivo e tente novamente."
+        return False, "Não foi possível atualizar a tabela de preços no momento. Confira o arquivo e tente novamente.", "error"
 
 
 def recalcular_cotacoes_pendentes(supabase, representante_id):
     """
     Atualiza os preços dos itens em cotações PENDENTES com base na nova tabela.
-    Respeita a regra: Retira vs Entrega (Cliente).
+    Retorna (quantidade_atualizada, sucesso_booleano).
     """
     try:
-        # 1. Buscar cotações pendentes + dados do cliente (para saber a coluna de preço)
-        # O Supabase permite select com join: cotacoes(..., clientes(coluna_preco))
         resp = supabase.table('cotacoes')\
             .select('id, forma_recebimento, clientes(coluna_preco)')\
             .eq('representante_id', representante_id)\
@@ -357,12 +427,10 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
         
         cotacoes_pendentes = resp.data
         if not cotacoes_pendentes:
-            return 0
+            return 0, True
         
-        # 2. Carregar TODOS os produtos atuais do representante (para consulta rápida de preço)
-        # Criamos um dicionário {codigo: {dados_do_produto}}
         prods_resp = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
-        mapa_produtos = {p['codigo']: p for p in prods_resp.data} # Mapeia pelo código
+        mapa_produtos = {p['codigo']: p for p in prods_resp.data}
         
         count_atualizadas = 0
         
@@ -370,7 +438,6 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
             cot_id = cot['id']
             forma_recebimento = cot.get('forma_recebimento')
             
-            # Determina a coluna de preço a usar
             cliente_data = cot.get('clientes') or {}
             coluna_cliente = cliente_data.get('coluna_preco') or 'preco_entrega'
             
@@ -379,7 +446,6 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
             else:
                 coluna_preco_target = coluna_cliente
             
-            # 3. Buscar itens da cotação
             itens_resp = supabase.table('cotacao_itens').select('*').eq('cotacao_id', cot_id).execute()
             itens = itens_resp.data
             
@@ -389,30 +455,16 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
             for item in itens:
                 cod_prod = item['codigo']
                 
-                # Verifica se o produto ainda existe na tabela nova
                 if cod_prod in mapa_produtos:
                     prod_novo = mapa_produtos[cod_prod]
-                    
-                    # Pega o novo preço base
                     novo_preco_base = float(prod_novo.get(coluna_preco_target) or 0.0)
-                    
-                    # Se o preço mudou, atualiza
-                    # Nota: Mantemos o desconto_percentual que já estava no item
-                    preco_antigo = float(item.get('preco_unitario') or 0.0)
-                    
-                    # Atualizamos sempre para garantir, ou checamos if novo_preco_base != preco_antigo
-                    # Vamos atualizar sempre para garantir sincronia
-                    
                     qtd = float(item['quantidade'])
                     desconto = float(item.get('desconto_percentual') or 0.0)
-                    
                     novo_subtotal = (novo_preco_base * qtd) * (1 - desconto/100)
                     
-                    # Atualiza o item no banco
                     supabase.table('cotacao_itens').update({
                         'preco_unitario': novo_preco_base,
                         'subtotal': novo_subtotal,
-                        # Opcional: atualizar nome/unidade se mudou
                         'produto': prod_novo.get('produto'),
                         'unidade': prod_novo.get('unidade')
                     }).eq('id', item['id']).execute()
@@ -420,23 +472,11 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
                     total_original_novo += novo_subtotal
                     teve_alteracao = True
                 else:
-                    # PRODUTO NÃO EXISTE MAIS?
-                    # Como é cotação PENDENTE e estamos "substituindo" a tabela, 
-                    # tecnicamente deveríamos remover o item ou alertar.
-                    # Por segurança do código, mantemos o valor antigo no somatório ou removemos.
-                    # Opção escolhida: Manter como está (item órfão) para não reduzir o valor bruscamente sem aviso,
-                    # mas idealmente o representante deve revisar.
                     total_original_novo += float(item['subtotal'])
             
-            # 4. Atualizar o total da cotação
             if teve_alteracao:
-                # Recalcula total final com desconto geral da cotação
-                # Precisamos pegar o desconto geral atual da cotação. 
-                # (Não veio no select inicial, mas podemos pegar ou assumir que o update lida com isso)
-                # Vamos fazer um fetch rápido para garantir
                 cot_full = supabase.table('cotacoes').select('desconto_geral_percentual').eq('id', cot_id).single().execute()
                 desc_geral = float(cot_full.data.get('desconto_geral_percentual') or 0.0)
-                
                 novo_total_final = total_original_novo * (1 - desc_geral/100)
                 
                 supabase.table('cotacoes').update({
@@ -446,11 +486,11 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
                 
                 count_atualizadas += 1
                 
-        return count_atualizadas
+        return count_atualizadas, True
 
     except Exception:
         logger.exception("Falha ao recalcular cotações pendentes")
-        return 0
+        return 0, False
 
 def exibir_preview_dados(df: pd.DataFrame):
     st.write(f"Linhas: {len(df)} | Colunas: {len(df.columns)}")
