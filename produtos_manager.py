@@ -7,11 +7,13 @@ ATUALIZADO:
 - Recálculo automático de cotações PENDENTES.
 """
 
+import io
 import logging
+import math
 import pandas as pd
 import numpy as np
 import re
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 from pathlib import Path
 import streamlit as st
 from datetime import datetime, timezone
@@ -43,12 +45,24 @@ MAPA_COLUNAS = {
     'preco_entrega_1': 'preco_entrega', 'preco_entrega': 'preco_entrega',
     'precoentrega': 'preco_entrega', 'entrega': 'preco_entrega',
     
-    'preco_100a199km': 'preco_100a199km', 'preco100a199km': 'preco_100a199km',
-    'preco_200a299km': 'preco_200a299km', 'preco200a299km': 'preco_200a299km',
-    'preco_300a399km': 'preco_300a399km', 'preco300a399km': 'preco_300a399km',
+    'preco_100a199km': 'preco_100a199km', 'preco100a199km': 'preco_100a199km', 'preco100199km': 'preco_100a199km',
+    'preco_200a299km': 'preco_200a299km', 'preco200a299km': 'preco_200a299km', 'preco200299km': 'preco_200a299km',
+    'preco_300a399km': 'preco_300a399km', 'preco300a399km': 'preco_300a399km', 'preco300399km': 'preco_300a399km',
     'preco_acima400km': 'preco_acima400km', 'precoac400km': 'preco_acima400km', 'precoacima400km': 'preco_acima400km',
     'preco_acima500km': 'preco_acima500km', 'precoac500km': 'preco_acima500km', 'precoacima500km': 'preco_acima500km',
     'preco_acima600km': 'preco_acima600km', 'precoac600km': 'preco_acima600km', 'precoacima600km': 'preco_acima600km',
+}
+
+NOMES_AMIGAVEIS_PRECO = {
+    'preco_retira': 'Retira',
+    'preco_entrega': 'Entrega (0 a 99 km)',
+    'preco_100a199km': '100 a 199 km',
+    'preco_200a299km': '200 a 299 km',
+    'preco_300a399km': '300 a 399 km',
+    'preco_acima400km': '400 a 500 km',
+    'preco_acima500km': '501 a 600 km',
+    'preco_acima600km': 'Acima de 600 km',
+    'preco_unico': 'Preço Único',
 }
 
 COLUNAS_OBRIGATORIAS = ['codigo', 'produto']
@@ -61,20 +75,42 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
     try:
         nome_arquivo = arquivo.name.lower()
         if nome_arquivo.endswith('.csv'):
-            tentativas = [
-                {'sep': ',', 'encoding': 'utf-8', 'dtype': str},
-                {'sep': ',', 'encoding': 'latin1', 'dtype': str},
-                {'sep': ';', 'encoding': 'utf-8', 'dtype': str},
-                {'sep': ';', 'encoding': 'latin1', 'dtype': str},
-            ]
-            for tent in tentativas:
+            arquivo.seek(0)
+            raw_bytes = arquivo.read()
+
+            texto = None
+            for enc in ['utf-8-sig', 'utf-8', 'utf-16', 'latin1', 'cp1252']:
                 try:
-                    arquivo.seek(0)
-                    df = pd.read_csv(arquivo, **tent)
+                    candidato = raw_bytes.decode(enc)
+                    if '\x00' not in candidato:
+                        texto = candidato
+                        break
+                except Exception:
+                    continue
+
+            if texto is None:
+                raise ValueError("Codificação do CSV não reconhecida.")
+
+            # Desembrulha linhas de dados caso o Excel tenha envolvido a linha inteira em aspas
+            linhas = texto.splitlines()
+            if len(linhas) >= 2 and not linhas[0].strip().startswith('"'):
+                linhas_limpas = [linhas[0]]
+                for linha in linhas[1:]:
+                    l_strip = linha.strip()
+                    if len(l_strip) >= 2 and l_strip.startswith('"') and l_strip.endswith('"'):
+                        linhas_limpas.append(l_strip[1:-1].replace('""', '"'))
+                    else:
+                        linhas_limpas.append(linha)
+                texto = '\n'.join(linhas_limpas)
+
+            for sep in [',', ';', '\t']:
+                try:
+                    df = pd.read_csv(io.StringIO(texto), sep=sep, dtype=str)
                     if len(df.columns) > 1:
                         return df
                 except Exception:
                     continue
+
             raise ValueError("Não foi possível ler o CSV.")
             
         elif nome_arquivo.endswith(('.xls', '.xlsx')):
@@ -84,7 +120,7 @@ def ler_arquivo(arquivo) -> Optional[pd.DataFrame]:
         logger.exception("Falha ao ler arquivo de produtos")
         st.error("Não foi possível ler o arquivo enviado. Verifique se é um CSV ou Excel (.xls, .xlsx) válido.")
         return None
-
+    
 def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
     def limpar(col):
         c = str(col).strip().lower()
@@ -145,9 +181,55 @@ def validar_dados(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     if faltando: msgs.append(f"❌ Faltando colunas: {faltando}")
     return len(faltando) == 0, msgs
 
+def interpretar_preco(val) -> Tuple[float, bool, str]:
+    """
+    Converte valor no padrão brasileiro (1234,56 ou 1.234,56) para float.
+    Retorna (valor_float, eh_valido, texto_original).
+    Células vazias retornam (0.0, True, '') para não gerar falso alerta.
+    """
+    if val is None or pd.isna(val):
+        return 0.0, True, ""
+
+    if isinstance(val, (int, float)):
+        num = float(val)
+        if math.isnan(num) or math.isinf(num) or num < 0:
+            return 0.0, False, str(val)
+        return num, True, str(val)
+
+    texto_original = str(val).strip()
+    if texto_original == "" or texto_original.lower() in {"nan", "none", "null"}:
+        return 0.0, True, ""
+
+    s = texto_original.replace('R$', '').replace('r$', '').replace(' ', '').strip()
+    if s == "":
+        return 0.0, False, texto_original
+
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+
+    try:
+        num = float(s)
+        if math.isnan(num) or math.isinf(num) or num < 0:
+            return 0.0, False, texto_original
+        return num, True, texto_original
+    except Exception:
+        return 0.0, False, texto_original
+
+def converter_preco(val) -> float:
+    """Mantém compatibilidade retornando apenas o float convertido."""
+    valor, _, _ = interpretar_preco(val)
+    return valor
+
 def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
+    # Guarda o número da linha original da planilha (linha 1 = cabeçalho, linha 2 = 1º dado)
+    df = df.copy()
+    df['_linha_planilha'] = df.index + 2
+
     # Remove linhas totalmente vazias
-    df = df.dropna(how='all').copy()
+    colunas_dados = [c for c in df.columns if c != '_linha_planilha']
+    df = df.dropna(subset=colunas_dados, how='all').copy()
     
     # Garante código como string limpa e remove vazios / 'nan'
     if 'codigo' in df.columns:
@@ -169,21 +251,32 @@ def limpar_dados(df: pd.DataFrame) -> pd.DataFrame:
             (df['produto'].str.lower() != 'none')
         ]
 
-    # Trata preços
+    # Trata preços e coleta avisos de linha/coluna para textos inválidos
+    avisos_precos: List[Dict[str, Any]] = []
     cols_preco = [c for c in df.columns if 'preco' in c]
-    for c in cols_preco:
-        df[c] = df[c].apply(converter_preco)
-        
-    return df
 
-def converter_preco(val):
-    if pd.isna(val): return 0.0
-    if isinstance(val, (int, float)): return float(val)
-    s = str(val).replace('R$', '').replace(' ', '').strip()
-    if ',' in s and '.' in s: s = s.replace('.', '').replace(',', '.')
-    elif ',' in s: s = s.replace(',', '.')
-    try: return float(s)
-    except Exception: return 0.0
+    for c in cols_preco:
+        valores_convertidos = []
+        nome_col_amigavel = NOMES_AMIGAVEIS_PRECO.get(c, c)
+
+        for _, row in df.iterrows():
+            val_float, valido, texto_orig = interpretar_preco(row[c])
+            valores_convertidos.append(val_float)
+
+            if not valido:
+                avisos_precos.append({
+                    'linha': int(row['_linha_planilha']),
+                    'coluna': nome_col_amigavel,
+                    'codigo': str(row.get('codigo', '')),
+                    'produto': str(row.get('produto', '')),
+                    'valor': texto_orig,
+                })
+
+        df[c] = valores_convertidos
+
+    df = df.drop(columns=['_linha_planilha'], errors='ignore')
+    df.attrs['avisos_precos'] = avisos_precos
+    return df
 
 def processar_arquivo_produtos(arquivo):
     df = ler_arquivo(arquivo)
@@ -203,40 +296,41 @@ def processar_arquivo_produtos(arquivo):
         
     return df_limpo
 
-# =====================================================================
-# SINCRONIZAÇÃO E RECÁLCULO (LÓGICA NOVA)
-# =====================================================================
-
 def calcular_impacto_sincronizacao(supabase, df: pd.DataFrame, representante_id: str, tabela: str = 'produtos') -> dict:
     """
-    Calcula quantos produtos atuais serão removidos (excluindo os protegidos por histórico)
+    Calcula quantos produtos ativos serão removidos ou inativados (preservados por histórico)
     ANTES de qualquer escrita no banco.
     """
     all_prods = (
         supabase.table(tabela)
-        .select('id, codigo')
+        .select('id, codigo, ativo')
         .eq('representante_id', representante_id)
         .execute()
         .data
     ) or []
 
-    total_atual = len(all_prods)
-    if total_atual == 0 or df is None or df.empty:
+    prods_ativos = [p for p in all_prods if p.get('ativo', True)]
+    total_atual = len(prods_ativos)
+
+    if not all_prods or df is None or df.empty:
         return {
             'total_atual': total_atual,
             'ids_final_delete': [],
+            'ids_para_inativar': [],
             'qtd_removiveis': 0,
             'qtd_preservados': 0,
             'exige_confirmacao': False,
         }
 
     codigos_novos = set(df['codigo'].astype(str).tolist())
-    ids_candidatos_exclusao = [p['id'] for p in all_prods if str(p['codigo']) not in codigos_novos]
+    ids_candidatos_saida = [p['id'] for p in all_prods if str(p['codigo']) not in codigos_novos]
+    qtd_ativos_saindo = len([p for p in prods_ativos if str(p['codigo']) not in codigos_novos])
 
-    if not ids_candidatos_exclusao:
+    if not ids_candidatos_saida:
         return {
             'total_atual': total_atual,
             'ids_final_delete': [],
+            'ids_para_inativar': [],
             'qtd_removiveis': 0,
             'qtd_preservados': 0,
             'exige_confirmacao': False,
@@ -255,8 +349,8 @@ def calcular_impacto_sincronizacao(supabase, df: pd.DataFrame, representante_id:
     ids_produtos_protegidos = set()
 
     if ids_cot_protegidas:
-        for i in range(0, len(ids_candidatos_exclusao), 100):
-            lote_prod = ids_candidatos_exclusao[i:i+100]
+        for i in range(0, len(ids_candidatos_saida), 100):
+            lote_prod = ids_candidatos_saida[i:i+100]
             resp = (
                 supabase.table('cotacao_itens')
                 .select('produto_id')
@@ -267,14 +361,19 @@ def calcular_impacto_sincronizacao(supabase, df: pd.DataFrame, representante_id:
             for item in (resp.data or []):
                 ids_produtos_protegidos.add(item['produto_id'])
 
-    ids_final_delete = [id_ for id_ in ids_candidatos_exclusao if id_ not in ids_produtos_protegidos]
-    qtd_removiveis = len(ids_final_delete)
-    exige_confirmacao = (qtd_removiveis / total_atual) > 0.5
+    ids_final_delete = [id_ for id_ in ids_candidatos_saida if id_ not in ids_produtos_protegidos]
+    ids_para_inativar = [
+        p['id'] for p in prods_ativos
+        if p['id'] in ids_produtos_protegidos
+    ]
+
+    exige_confirmacao = (total_atual > 0) and ((qtd_ativos_saindo / total_atual) > 0.5)
 
     return {
         'total_atual': total_atual,
         'ids_final_delete': ids_final_delete,
-        'qtd_removiveis': qtd_removiveis,
+        'ids_para_inativar': ids_para_inativar,
+        'qtd_removiveis': qtd_ativos_saindo,
         'qtd_preservados': len(ids_produtos_protegidos),
         'exige_confirmacao': exige_confirmacao,
     }
@@ -290,8 +389,8 @@ def sincronizar_produtos_supabase(
 ):
     """
     1. Valida impacto antes de qualquer alteração no banco.
-    2. Atualiza/Insere produtos novos (Upsert).
-    3. Remove produtos antigos que NÃO estão no arquivo, EXCETO se estiverem em cotações APROVADA/CANCELADA.
+    2. Atualiza/Insere produtos novos (Upsert) marcando ativo = True.
+    3. Remove produtos fora da planilha sem histórico e marca ativo = False nos que têm histórico.
     4. Atualiza preços das cotações PENDENTES.
     Retorna (sucesso: bool, mensagem: str, nivel: 'success' | 'warning' | 'error').
     """
@@ -310,31 +409,34 @@ def sincronizar_produtos_supabase(
         if impacto['exige_confirmacao'] and not confirmar_exclusao_em_massa:
             return (
                 False,
-                f"Operação bloqueada: {impacto['qtd_removiveis']} de {impacto['total_atual']} produtos ativos seriam removidos. "
+                f"Operação bloqueada: {impacto['qtd_removiveis']} de {impacto['total_atual']} produtos ativos sairiam do catálogo. "
                 "Marque a caixa de confirmação para continuar.",
                 "error",
             )
 
+        agora_iso = datetime.now(timezone.utc).isoformat()
         df = df.copy()
         df['representante_id'] = representante_id
-        df['updated_at'] = datetime.now(timezone.utc).isoformat()
+        df['updated_at'] = agora_iso
+        df['ativo'] = True
         
         # ---------------------------------------------------------
-        # 1. UPSERT (Atualiza a base com a tabela nova)
+        # 1. UPSERT (Atualiza/reativa a base com a tabela nova)
         # ---------------------------------------------------------
         colunas_validas = {
             'representante_id', 'codigo', 'produto', 'unidade',
             'preco_retira', 'preco_entrega',
             'preco_100a199km', 'preco_200a299km', 'preco_300a399km',
             'preco_acima400km', 'preco_acima500km', 'preco_acima600km',
-            'updated_at'
+            'updated_at', 'ativo'
         }
         df = df[[c for c in df.columns if c in colunas_validas]].copy()
         records = df.to_dict('records')
         
         for r in records:
             for k, v in r.items():
-                if pd.isna(v): r[k] = None
+                if pd.isna(v):
+                    r[k] = None
                 
         batch_size = 100
         progresso = st.progress(0, text="Atualizando catálogo...")
@@ -342,17 +444,18 @@ def sincronizar_produtos_supabase(
         for i in range(0, len(records), batch_size):
             batch = records[i:i+batch_size]
             supabase.table(tabela).upsert(batch, on_conflict='representante_id, codigo').execute()
-            progresso.progress(min((i+batch_size)/len(records), 0.8))
+            progresso.progress(min((i+batch_size)/len(records), 0.75))
             
         # ---------------------------------------------------------
-        # 2. LIMPEZA (Substituição Inteligente)
+        # 2. LIMPEZA E INATIVAÇÃO (Substituição Inteligente)
         # ---------------------------------------------------------
         ids_final_delete = impacto['ids_final_delete']
+        ids_para_inativar = impacto['ids_para_inativar']
         qtd_preservados = impacto['qtd_preservados']
         qtd_removidos = 0
         
         if ids_final_delete:
-            progresso.progress(0.85, text="Removendo itens fora de linha...")
+            progresso.progress(0.80, text="Removendo itens fora de linha sem histórico...")
             cot_pend = (
                 supabase.table('cotacoes')
                 .select('id')
@@ -382,6 +485,17 @@ def sincronizar_produtos_supabase(
 
             qtd_removidos = len(ids_final_delete)
 
+        if ids_para_inativar:
+            progresso.progress(0.85, text="Inativando itens antigos com histórico...")
+            for i in range(0, len(ids_para_inativar), 100):
+                lote_inativar = ids_para_inativar[i:i+100]
+                (
+                    supabase.table(tabela)
+                    .update({'ativo': False, 'updated_at': agora_iso})
+                    .in_('id', lote_inativar)
+                    .execute()
+                )
+
         # ---------------------------------------------------------
         # 3. RECÁLCULO DE COTAÇÕES PENDENTES
         # ---------------------------------------------------------
@@ -395,7 +509,7 @@ def sincronizar_produtos_supabase(
         if qtd_removidos > 0:
             msg += f" 🗑️ {qtd_removidos} fora de linha removidos."
         if qtd_preservados > 0:
-            msg += f" 🛡️ {qtd_preservados} antigos mantidos por histórico."
+            msg += f" 🛡️ {qtd_preservados} descontinuados ocultados da busca e mantidos no histórico."
 
         if not recalculo_ok:
             msg += " ⚠️ Tabela atualizada, mas não foi possível recalcular as cotações pendentes automaticamente."
@@ -415,7 +529,7 @@ def sincronizar_produtos_supabase(
 
 def recalcular_cotacoes_pendentes(supabase, representante_id):
     """
-    Atualiza os preços dos itens em cotações PENDENTES com base na nova tabela.
+    Atualiza os preços dos itens em cotações PENDENTES com base na nova tabela ativa.
     Retorna (quantidade_atualizada, sucesso_booleano).
     """
     try:
@@ -429,7 +543,13 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
         if not cotacoes_pendentes:
             return 0, True
         
-        prods_resp = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
+        prods_resp = (
+            supabase.table('produtos')
+            .select('*')
+            .eq('representante_id', representante_id)
+            .eq('ativo', True)
+            .execute()
+        )
         mapa_produtos = {p['codigo']: p for p in prods_resp.data}
         
         count_atualizadas = 0
@@ -493,10 +613,24 @@ def recalcular_cotacoes_pendentes(supabase, representante_id):
         return 0, False
 
 def exibir_preview_dados(df: pd.DataFrame):
+    avisos_precos = df.attrs.get('avisos_precos', [])
+    if avisos_precos:
+        st.warning(
+            f"⚠️ Atenção: encontramos **{len(avisos_precos)}** célula(s) com texto inválido nas colunas de preço. "
+            "Se você continuar, esses campos serão gravados como **R$ 0,00**."
+        )
+        with st.expander("🔍 Ver linhas e colunas com preço inválido", expanded=True):
+            df_avisos = pd.DataFrame(avisos_precos).rename(columns={
+                'linha': 'Linha na planilha',
+                'coluna': 'Coluna',
+                'codigo': 'Código',
+                'produto': 'Produto',
+                'valor': 'Valor encontrado',
+            })
+            st.dataframe(df_avisos, hide_index=True, width="stretch")
+
     st.write(f"Linhas: {len(df)} | Colunas: {len(df.columns)}")
     st.dataframe(df.head())
-
-
 
 
 

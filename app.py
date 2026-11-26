@@ -645,6 +645,18 @@ def atualizar_visualiza_preco(cliente_id, pode_ver, representante_id):
         st.error("Não foi possível atualizar a permissão de preços.")
         return False
 
+def atualizar_permite_retirada(cliente_id, permite_retirada, representante_id):
+    """Atualiza flag de permissão de retirada garantindo isolamento por representante"""
+    try:
+        supabase.table('clientes').update({
+            'permite_retirada': permite_retirada
+        }).eq('id', cliente_id).eq('representante_id', representante_id).execute()
+        return True
+    except Exception as e:
+        registrar_erro("Atualizar permissão de retirada do cliente", e)
+        st.error("Não foi possível atualizar a permissão de retirada.")
+        return False
+
 def upload_clientes_excel(arquivo, representante_id):
     """
     Lê Excel ou CSV de clientes e faz upsert no banco usando ID para evitar conflitos
@@ -738,6 +750,12 @@ def upload_clientes_excel(arquivo, representante_id):
             val_visu = str(row.get('VISUALIZAPRECO', '')).lower().strip()
             if val_visu in ['não', 'nao', 'n', 'false', '0', 'block']:
                 visualiza = False
+
+            # --- PERMITE RETIRADA (desabilitada por padrão) ---
+            permite_ret = False
+            val_ret = str(row.get('PERMITERETIRADA', '')).lower().strip()
+            if val_ret in ['sim', 's', 'true', '1', 'yes', 'liberado']:
+                permite_ret = True
             
             cliente_dict = {
                 'representante_id': representante_id,
@@ -748,8 +766,10 @@ def upload_clientes_excel(arquivo, representante_id):
                 'distancia_km': dist_val,
                 'coluna_preco': coluna_preco,
                 'visualiza_preco': visualiza,
+                'permite_retirada': permite_ret,
                 'status_cliente': 'CLIENTE'
             }
+
             if not cliente_id:
                 cliente_dict['senha_hash'] = None
             
@@ -780,9 +800,15 @@ def upload_clientes_excel(arquivo, representante_id):
 # =====================================================================
 
 def carregar_produtos(representante_id):
-    """Carrega produtos do representante"""
+    """Carrega apenas produtos ativos do representante"""
     try:
-        response = supabase.table('produtos').select('*').eq('representante_id', representante_id).execute()
+        response = (
+            supabase.table('produtos')
+            .select('*')
+            .eq('representante_id', representante_id)
+            .eq('ativo', True)
+            .execute()
+        )
         return pd.DataFrame(response.data)
     except Exception as e:
         registrar_erro("Carregar produtos do representante", e)
@@ -795,6 +821,7 @@ def carregar_catalogo_representante(representante_id: str) -> pd.DataFrame:
         supabase.table('produtos')
         .select('id,codigo,produto,unidade,preco_retira,preco_entrega,preco_100a199km,preco_200a299km,preco_300a399km,preco_acima400km,preco_acima500km,preco_acima600km')
         .eq('representante_id', representante_id)
+        .eq('ativo', True)
         .execute()
     )
     data = response.data or []
@@ -857,16 +884,16 @@ def get_preco_produto(produto_row, coluna_preco, forma_recebimento):
 def obter_opcoes_distancia():
     """
     Retorna as opções de distância disponíveis no sistema.
-    Ordem: retirada, entrega (até 100km), depois distâncias crescentes.
+    Ordem: retirada, entrega (0 a 99 km), depois distâncias crescentes.
     """
     return [
         ("Retirada no centro de distribuição", "preco_retira"),
-        ("Entrega (até 100 km)", "preco_entrega"),
+        ("Entrega (0 a 99 km)", "preco_entrega"),
         ("100 a 199 km", "preco_100a199km"),
         ("200 a 299 km", "preco_200a299km"),
         ("300 a 399 km", "preco_300a399km"),
-        ("Acima de 400 km", "preco_acima400km"),
-        ("Acima de 500 km", "preco_acima500km"),
+        ("400 a 500 km", "preco_acima400km"),
+        ("501 a 600 km", "preco_acima500km"),
         ("Acima de 600 km", "preco_acima600km"),
     ]
 
@@ -1038,6 +1065,11 @@ def upload_tabela_precos_csv(arquivo, representante_id):
 # =====================================================================
 # FUNÇÕES DE DADOS - COTAÇÕES
 # =====================================================================
+
+AVISO_PRECOS_REFERENCIAIS = (
+    "Observação: Os preços apresentados são referenciais e estão sujeitos a alteração "
+    "até o fechamento e aprovação do pedido pelo Representante."
+)
 
 def carregar_cotacoes(representante_id):
     """Carrega cotações do representante"""
@@ -1309,10 +1341,17 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
                 pdf.cell(55, 6, '-', border=1, ln=True)
         
         pdf.ln(5)
+        pdf.set_font('Arial', 'I', 8)
+        pdf.multi_cell(
+            0,
+            5,
+            'Observacao: Os precos apresentados sao referenciais e estao sujeitos a alteracao ate o fechamento e aprovacao do pedido pelo representante.'
+        )
+        pdf.ln(2)
         pdf.set_font('Arial', '', 8)
         pdf.cell(0, 8, 'Gerado via RC Online', ln=True, align='R')
         
-        return pdf.output(dest='S').encode('latin-1')
+        return pdf.output(dest='S').encode('latin-1', errors='replace')
         
     except Exception as e:
         registrar_erro("Gerar PDF da cotação", e)
@@ -1668,6 +1707,7 @@ def pagina_gestao_clientes(representante_id):
                 cidade_novo = st.text_input("Cidade", key="cidade_cliente_novo")
                 distancia_novo = st.number_input("Distância (KM)", min_value=0, value=0, help="Define a tabela de preço automaticamente", key="distancia_cliente_novo")
                 pode_ver_preco_novo = st.toggle("Pode visualizar preços?", value=True)
+                permite_retirada_novo = st.toggle("Pode retirar no centro de distribuição?", value=False)
             
             submitted = st.form_submit_button("Cadastrar Cliente")
             
@@ -1700,6 +1740,7 @@ def pagina_gestao_clientes(representante_id):
                             'distancia_km': dist,
                             'coluna_preco': coluna_preco,
                             'visualiza_preco': pode_ver_preco_novo,
+                            'permite_retirada': permite_retirada_novo,
                             'status_cliente': 'CLIENTE',
                             'senha_hash': None
                         }).execute()
@@ -1774,7 +1815,19 @@ def pagina_gestao_clientes(representante_id):
                 # Se mudou o valor, salva imediatamente no banco validando o representante
                 if novo_valor != valor_atual:
                     atualizar_visualiza_preco(row['id'], novo_valor, representante_id)
-                    st.toast(f"Permissão de {row['nome']} atualizada!")
+                    st.toast(f"Permissão de preços de {row['nome']} atualizada!")
+
+                # Toggle de permissão de retirada (desabilitada por padrão)
+                retirada_atual = bool(row.get('permite_retirada', False))
+                nova_retirada = st.toggle(
+                    "Permite Retirada",
+                    value=retirada_atual,
+                    key=f"permiteretirada_{row['id']}"
+                )
+
+                if nova_retirada != retirada_atual:
+                    atualizar_permite_retirada(row['id'], nova_retirada, representante_id)
+                    st.toast(f"Permissão de retirada de {row['nome']} atualizada!")
             
             with col3:
                 # Botão de Reset de Senha (isolado por representante_id)
@@ -2182,31 +2235,28 @@ def pagina_nova_cotacao(cliente):
     tem_itens_no_carrinho = len(st.session_state.itens_cotacao) > 0
 
     # ============================================================
-    # 2. DEFINIÇÃO DA COLUNA DE PREÇO DO CLIENTE
+    # 2. DEFINIÇÃO DA COLUNA DE PREÇO E PERMISSÃO DE RETIRADA
     # ============================================================
-    # Busca o nome da coluna correta usando a chave com underscore
     coluna_preco_cliente = cliente.get("coluna_preco")
-    
-    # Se por acaso estiver vazio, definimos o padrão
     if not coluna_preco_cliente:
         coluna_preco_cliente = "preco_entrega"
 
-    opcoes_recebimento = ["Retirada no centro de distribuição", "Entrega"]
-    
-    # ============================================================
-    # 3. SELEÇÃO COM TRAVA DE SEGURANÇA
-    # ============================================================
-    forma_recebimento = st.radio(
-        "Como deseja receber os produtos?",
-        opcoes_recebimento,
-        key="forma_recebimento_cotacao",
-        disabled=tem_itens_no_carrinho, # <--- TRAVA O BOTÃO SE TIVER ITENS
-        help="Para alterar a forma de entrega, remova os itens da cotação atual."
-    )
+    permite_retirada_cliente = bool(cliente.get("permite_retirada", False))
 
-    # Feedback visual para o usuário entender
-    if tem_itens_no_carrinho:
-        st.caption("🔒 *Para mudar a forma de entrega, clique em 'Limpar Tudo' no final da página.*")
+    if permite_retirada_cliente:
+        opcoes_recebimento = ["Entrega", "Retirada no centro de distribuição"]
+        forma_recebimento = st.radio(
+            "Como deseja receber os produtos?",
+            opcoes_recebimento,
+            key="forma_recebimento_cotacao",
+            disabled=tem_itens_no_carrinho,
+            help="Para alterar a forma de recebimento, remova os itens da cotação atual."
+        )
+        if tem_itens_no_carrinho:
+            st.caption("🔒 *Para mudar a forma de recebimento, clique em 'Limpar Tudo' no final da página.*")
+    else:
+        forma_recebimento = "Entrega"
+        st.info("🚚 **Forma de recebimento:** Entrega (caso precise retirar no centro de distribuição, verifique com seu seu Representante).")
 
     if forma_recebimento == "Retirada no centro de distribuição":
         # Corrigido para "preco_retira" para bater com o banco
@@ -2390,8 +2440,10 @@ def pagina_nova_cotacao(cliente):
                 total_final = sum(item["subtotal_final"] for item in itens)
                 
             st.markdown(f"### Total Estimado: R$ {total_final:.2f}")
+            st.caption(f"ℹ️ {AVISO_PRECOS_REFERENCIAIS}")
         else:
             st.info("Os valores totais desta cotação serão calculados e enviados pelo representante.")
+            st.caption(f"ℹ️ {AVISO_PRECOS_REFERENCIAIS}")
 
         col1, col2 = st.columns([1, 4])
 
@@ -2515,6 +2567,8 @@ def pagina_meus_pedidos(cliente):
                 
                 st.dataframe(df_show, width='stretch')
             
+            st.caption(f"ℹ️ {AVISO_PRECOS_REFERENCIAIS}")
+                      
             # 5. Controla visualização no PDF (validando cliente_id da sessão)
             pdf_bytes = gerar_pdf_cotacao(cot['id'], mostrar_precos_nesta_cotacao, cliente_id=cliente['id'])
             st.download_button(
