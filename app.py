@@ -484,16 +484,23 @@ def autenticar_representante(email, senha):
         return None, msg_bloqueio
 
     try:
-        response = supabase.auth.sign_in_with_password({"email": email_limpo, "password": senha})
+        # Usa cliente isolado para não sobrescrever a chave administrativa do cliente global
+        auth_client = create_client(supabase_url, supabase_key)
+        response = auth_client.auth.sign_in_with_password({"email": email_limpo, "password": senha})
         user_id = response.user.id
-        rep_data = supabase.table('representantes').select('*').eq('id', user_id).single().execute()
+
+        rep_resp = supabase.table('representantes').select('*').eq('id', user_id).execute()
+        if not rep_resp.data:
+            logger.warning(f"Usuário autenticado sem perfil na tabela representantes (id={user_id})")
+            return None, "Cadastro de representante não localizado. Contate a administração."
+
         limpar_tentativas_login(email_limpo, 'REPRESENTANTE')
-        return rep_data.data, "Login realizado com sucesso!"
+        return rep_resp.data[0], "Login realizado com sucesso!"
     except Exception as e:
         logger.warning(f"Falha na autenticação do representante ({type(e).__name__})")
         msg_falha = registrar_falha_login(email_limpo, 'REPRESENTANTE')
         return None, f"Usuário ou senha incorretos. {msg_falha}"
-    
+        
 def criar_representante_admin(nome, email, senha, telefone):
     """Cria representante via API administrativa do Supabase com troca obrigatória de senha no 1º acesso (SEG-12)"""
     try:
