@@ -136,7 +136,7 @@ Regra de migração: primeiro acrescentamos tabelas, colunas e funções; depois
   6. **Não localizado:** se o CEP for inválido ou a API estiver fora do ar, o cadastro fica com **distância pendente** (status próprio, diferente de `PENDENTE` da cotação), preço oculto e aviso para o representante preencher a distância.
   7. **Valores referenciais:** a simulação é referencial e só vale após o pedido fechado e aprovado, então a meta é acertar cerca de 80% dos casos e deixar o resto para o ajuste do representante.
      Teste: decisão registrada aqui.
-- [ ] **INF-8 · Projeto Supabase de produção.** Criar o 2º projeto gratuito no Supabase para Produção, aplicar os scripts SQL (`000` a `007`) e conferir que nada de produção aponta para o teste. Teste: os dois projetos aparecem no painel e estão isolados.
+- [x] **INF-8 · Projeto Supabase de produção.** Criar o 2º projeto gratuito no Supabase para Produção, aplicar os scripts SQL (`000` a `007`) e conferir que nada de produção aponta para o teste. Teste: os dois projetos aparecem no painel e estão isolados.
 - [ ] **INF-6 · Publicar piloto no Streamlit Community Cloud.** Subir a branch `main` (atualizada com `dev`), configurar os `secrets` no painel do Streamlit Cloud e ativar a rotina semanal de backup manual (**BKP-1**) desde o dia 1 do piloto. Teste: o cliente piloto acessa pelo link HTTPS e faz uma cotação real.
 
 **Pronto quando:** o 1º cliente piloto opera no Streamlit com segurança e as regras estão documentadas com gabarito.
