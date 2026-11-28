@@ -807,16 +807,29 @@ def upload_clientes_excel(arquivo, representante_id):
 # =====================================================================
 
 def carregar_produtos(representante_id):
-    """Carrega apenas produtos ativos do representante"""
+    """Carrega todos os produtos ativos do representante (paginado acima de 1.000 registros)"""
     try:
-        response = (
-            supabase.table('produtos')
-            .select('*')
-            .eq('representante_id', representante_id)
-            .eq('ativo', True)
-            .execute()
-        )
-        return pd.DataFrame(response.data)
+        todos_produtos = []
+        tamanho_pagina = 1000
+        inicio = 0
+
+        while True:
+            response = (
+                supabase.table('produtos')
+                .select('*')
+                .eq('representante_id', representante_id)
+                .eq('ativo', True)
+                .range(inicio, inicio + tamanho_pagina - 1)
+                .execute()
+            )
+            lote = response.data or []
+            todos_produtos.extend(lote)
+
+            if len(lote) < tamanho_pagina:
+                break
+            inicio += tamanho_pagina
+
+        return pd.DataFrame(todos_produtos)
     except Exception as e:
         registrar_erro("Carregar produtos do representante", e)
         st.error("Não foi possível carregar os produtos no momento.")
@@ -824,15 +837,27 @@ def carregar_produtos(representante_id):
     
 @st.cache_data(ttl=300)  # 5 minutos
 def carregar_catalogo_representante(representante_id: str) -> pd.DataFrame:
-    response = (
-        supabase.table('produtos')
-        .select('id,codigo,produto,unidade,preco_retira,preco_entrega,preco_100a199km,preco_200a299km,preco_300a399km,preco_acima400km,preco_acima500km,preco_acima600km')
-        .eq('representante_id', representante_id)
-        .eq('ativo', True)
-        .execute()
-    )
-    data = response.data or []
-    return pd.DataFrame(data)
+    todos_produtos = []
+    tamanho_pagina = 1000
+    inicio = 0
+
+    while True:
+        response = (
+            supabase.table('produtos')
+            .select('id,codigo,produto,unidade,preco_retira,preco_entrega,preco_100a199km,preco_200a299km,preco_300a399km,preco_acima400km,preco_acima500km,preco_acima600km')
+            .eq('representante_id', representante_id)
+            .eq('ativo', True)
+            .range(inicio, inicio + tamanho_pagina - 1)
+            .execute()
+        )
+        lote = response.data or []
+        todos_produtos.extend(lote)
+
+        if len(lote) < tamanho_pagina:
+            break
+        inicio += tamanho_pagina
+
+    return pd.DataFrame(todos_produtos)
 
 def buscar_produtos(representante_id, termo):
     """Busca produtos por código ou nome (sem exigir acento)"""
@@ -1600,11 +1625,12 @@ def pagina_upload_tabela_precos(representante_id):
                             representante_id=representante_id,
                             confirmar_exclusao_em_massa=confirmou_exclusao
                         )
-
                     if sucesso:
+                        carregar_catalogo_representante.clear()
                         st.session_state["feedback_sincronizacao"] = (nivel, mensagem)
                         st.session_state['recarregar_pagina'] = True
                         st.rerun()
+
                     else:
                         logger.error(f"Falha ao sincronizar tabela de preços: {mensagem}")
                         st.error(mensagem)
