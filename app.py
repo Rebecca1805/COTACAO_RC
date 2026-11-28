@@ -1729,6 +1729,11 @@ def pagina_gestao_clientes(representante_id):
     """Página de gestão de clientes (Cadastro e Edição)"""
     st.subheader("👥 Gestão de Clientes")
     
+    # Exibe feedback salvo antes do rerun após cadastro com sucesso
+    msg_cadastro_cli = st.session_state.pop("msg_sucesso_cadastro_cliente", None)
+    if msg_cadastro_cli:
+        st.success(msg_cadastro_cli)
+
     # =========================================================
     # 1. CADASTRO MANUAL DE NOVO CLIENTE
     # =========================================================
@@ -1745,50 +1750,99 @@ def pagina_gestao_clientes(representante_id):
             with c2:
                 cidade_novo = st.text_input("Cidade", key="cidade_cliente_novo")
                 distancia_novo = st.number_input("Distância (KM)", min_value=0, value=0, help="Define a tabela de preço automaticamente", key="distancia_cliente_novo")
-                pode_ver_preco_novo = st.toggle("Pode visualizar preços?", value=True)
-                permite_retirada_novo = st.toggle("Pode retirar no centro de distribuição?", value=False)
+                pode_ver_preco_novo = st.toggle("Pode visualizar preços?", value=True, key="visu_preco_cliente_novo")
+                permite_retirada_novo = st.toggle("Pode retirar no centro de distribuição?", value=False, key="permite_retirada_cliente_novo")
             
             submitted = st.form_submit_button("Cadastrar Cliente")
             
             if submitted:
-                if not nome_novo:
+                cnpj_limpo = so_digitos(cnpj_novo)
+                tel_limpo = so_digitos(telefone_novo)
+
+                if not nome_novo or not nome_novo.strip():
                     st.error("O campo Nome é obrigatório.")
-                elif not (cnpj_novo or telefone_novo):
+                elif not (cnpj_limpo or tel_limpo):
                     st.error("É necessário informar ao menos CNPJ ou Telefone.")
                 else:
-                    # --- NOVA LÓGICA DE DISTÂNCIA NO MANUAL ---
-                    dist = int(distancia_novo)
-                    coluna_preco = 'preco_entrega' # Padrão (0-100km)
-                    
-                    if dist < 100: coluna_preco = 'preco_entrega'
-                    elif dist < 200: coluna_preco = 'preco_100a199km'
-                    elif dist < 300: coluna_preco = 'preco_200a299km'
-                    elif dist < 400: coluna_preco = 'preco_300a399km'
-                    elif dist <= 500: coluna_preco = 'preco_acima400km'
-                    elif dist <= 600: coluna_preco = 'preco_acima500km'
-                    else: coluna_preco = 'preco_acima600km'
-                    # -----------------------------------------
-                    
+                    # Verifica duplicidade separadamente para dar mensagem exata
+                    duplicado_encontrado = False
                     try:
-                        supabase.table('clientes').insert({
-                            'representante_id': representante_id,
-                            'nome': nome_novo.upper(),
-                            'cnpj': so_digitos(cnpj_novo),
-                            'telefone': so_digitos(telefone_novo),
-                            'cidade': cidade_novo,
-                            'distancia_km': dist,
-                            'coluna_preco': coluna_preco,
-                            'visualiza_preco': pode_ver_preco_novo,
-                            'permite_retirada': permite_retirada_novo,
-                            'status_cliente': 'CLIENTE',
-                            'senha_hash': None
-                        }).execute()
+                        if cnpj_limpo:
+                            dup_cnpj = (
+                                supabase.table('clientes')
+                                .select('id, nome')
+                                .eq('cnpj', cnpj_limpo)
+                                .execute()
+                            )
+                            if dup_cnpj.data:
+                                st.error(f"❌ Já existe um cliente cadastrado com este CNPJ ({dup_cnpj.data[0].get('nome', '')}).")
+                                duplicado_encontrado = True
+
+                        if not duplicado_encontrado and tel_limpo:
+                            dup_tel = (
+                                supabase.table('clientes')
+                                .select('id, nome')
+                                .eq('telefone', tel_limpo)
+                                .execute()
+                            )
+                            if dup_tel.data:
+                                st.error(f"❌ Já existe um cliente cadastrado com este Telefone ({dup_tel.data[0].get('nome', '')}).")
+                                duplicado_encontrado = True
+                    except Exception as e_check:
+                        registrar_erro("Verificação de duplicidade no cadastro manual de cliente", e_check)
+
+                    if not duplicado_encontrado:
+                        dist = int(distancia_novo)
+                        coluna_preco = 'preco_entrega'  # Padrão (0-99km)
                         
-                        st.success(f"✅ Cliente {nome_novo} cadastrado! Ele já pode criar sua própria senha no 1º acesso.")
-                        st.rerun()
-                    except Exception as e:
-                        registrar_erro("Cadastro manual de cliente", e)
-                        st.error("Não foi possível cadastrar o cliente. Verifique se o CNPJ já não existe ou tente novamente.")
+                        if dist < 100: coluna_preco = 'preco_entrega'
+                        elif dist < 200: coluna_preco = 'preco_100a199km'
+                        elif dist < 300: coluna_preco = 'preco_200a299km'
+                        elif dist < 400: coluna_preco = 'preco_300a399km'
+                        elif dist <= 500: coluna_preco = 'preco_acima400km'
+                        elif dist <= 600: coluna_preco = 'preco_acima500km'
+                        else: coluna_preco = 'preco_acima600km'
+                        
+                        try:
+                            supabase.table('clientes').insert({
+                                'representante_id': representante_id,
+                                'nome': nome_novo.strip().upper(),
+                                'cnpj': cnpj_limpo if cnpj_limpo else None,
+                                'telefone': tel_limpo if tel_limpo else None,
+                                'cidade': cidade_novo.strip(),
+                                'distancia_km': dist,
+                                'coluna_preco': coluna_preco,
+                                'visualiza_preco': pode_ver_preco_novo,
+                                'permite_retirada': permite_retirada_novo,
+                                'status_cliente': 'CLIENTE',
+                                'senha_hash': None
+                            }).execute()
+
+                            # Limpa todos os campos do formulário para o próximo cadastro
+                            for campo_key in [
+                                "nome_cliente_novo",
+                                "cnpj_cliente_novo",
+                                "telefone_cliente_novo",
+                                "cidade_cliente_novo",
+                                "distancia_cliente_novo",
+                                "visu_preco_cliente_novo",
+                                "permite_retirada_cliente_novo",
+                            ]:
+                                st.session_state.pop(campo_key, None)
+
+                            st.session_state["msg_sucesso_cadastro_cliente"] = (
+                                f"✅ Cliente {nome_novo.strip().upper()} cadastrado! Ele já pode criar sua própria senha no 1º acesso."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            registrar_erro("Cadastro manual de cliente", e)
+                            detalhe_erro = str(e).lower()
+                            if "telefone" in detalhe_erro:
+                                st.error("❌ Já existe um cliente cadastrado com este Telefone.")
+                            elif "cnpj" in detalhe_erro:
+                                st.error("❌ Já existe um cliente cadastrado com este CNPJ.")
+                            else:
+                                st.error("Não foi possível cadastrar o cliente. Verifique os dados e tente novamente.")
     st.markdown("---")
     
     # =========================================================
@@ -1972,7 +2026,19 @@ def pagina_gerenciar_cotacoes(representante_id):
                 df_edit = df_edit.rename(columns={
                     'codigo': 'Código', 'produto': 'Produto', 'quantidade': 'Qtde',
                     'preco_unitario': 'Preço Unit.', 'desconto_percentual': 'Desconto (%)', 'subtotal': 'Subtotal'
-                })
+                }).reset_index(drop=True)
+
+                # Recalcula em tempo real o Subtotal de cada linha editada na tabela
+                editor_key = f"editor_{cot['id']}"
+                edicoes_pendentes = st.session_state.get(editor_key, {}).get("edited_rows", {})
+                for idx_linha, alteracoes in edicoes_pendentes.items():
+                    if idx_linha < len(df_edit) and "Desconto (%)" in alteracoes:
+                        raw_d_cell = alteracoes["Desconto (%)"]
+                        desc_cell = 0.0 if raw_d_cell is None or pd.isna(raw_d_cell) else float(raw_d_cell)
+                        desc_cell = max(0.0, min(100.0, desc_cell))
+                        preco_cell = float(df_edit.at[idx_linha, 'Preço Unit.'])
+                        qtd_cell = float(df_edit.at[idx_linha, 'Qtde'])
+                        df_edit.at[idx_linha, 'Subtotal'] = (preco_cell * qtd_cell) * (1 - desc_cell / 100)
                 
                 df_editado = st.data_editor(
                     df_edit,
@@ -1984,17 +2050,47 @@ def pagina_gerenciar_cotacoes(representante_id):
                         "Subtotal": st.column_config.NumberColumn(format="R$ %.2f", disabled=True, width="small"),
                         "Desconto (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.5, format="%.1f%%", width="small")
                     },
-                    hide_index=True, width='stretch', key=f"editor_{cot['id']}"
+                    hide_index=True, width='stretch', key=editor_key
                 )
                 
-                c_desc, c_save = st.columns([1, 2])
+                c_desc, c_prev, c_save = st.columns([1.2, 1.5, 1.3])
                 with c_desc:
                     desc_geral = float(cot.get('desconto_geral_percentual', 0))
-                    novo_desconto_geral = st.number_input("Desconto Extra no Total (%)", min_value=0.0, max_value=100.0, value=desc_geral, step=0.5, key=f"desc_geral_{cot['id']}")
+                    novo_desconto_geral = st.number_input(
+                        "Desconto Extra no Total (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=desc_geral,
+                        step=0.5,
+                        key=f"desc_geral_{cot['id']}"
+                    )
+
+                soma_subtotais_prev = 0.0
+                for _, r_prev in df_editado.iterrows():
+                    p_prev = float(r_prev['Preço Unit.'])
+                    q_prev = float(r_prev['Qtde'])
+                    raw_d = r_prev.get('Desconto (%)', 0.0)
+                    d_prev = 0.0 if pd.isna(raw_d) else float(raw_d)
+                    soma_subtotais_prev += (p_prev * q_prev) * (1 - d_prev / 100)
+
+                total_final_prev = soma_subtotais_prev * (1 - novo_desconto_geral / 100)
+                houve_alteracao_desc = (
+                    abs(total_final_prev - total_final) > 0.009
+                    or abs(novo_desconto_geral - desc_geral) > 0.009
+                )
+
+                with c_prev:
+                    st.metric(
+                        label="Prévia do Total Final",
+                        value=f"R$ {total_final_prev:,.2f}",
+                        delta=f"R$ {total_final_prev - total_final:,.2f}" if houve_alteracao_desc else "Sem alterações",
+                        delta_color="inverse" if houve_alteracao_desc else "off"
+                    )
+
                 with c_save:
                     st.write("")
                     st.write("")
-                    if st.button("💾 Salvar Tudo", type="primary", key=f"btn_save_all_{cot['id']}"):
+                    if st.button("✅ Salvar Descontos no Pedido", type="primary", key=f"btn_save_all_{cot['id']}"):
                         sucesso = recalcular_e_salvar_itens(cot['id'], df_editado, novo_desconto_geral, representante_id)
                         if sucesso:
                             st.success("Cotação recalculada e salva com sucesso!")
