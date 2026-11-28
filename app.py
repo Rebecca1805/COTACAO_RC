@@ -1240,7 +1240,9 @@ def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual
         for _, row in df_itens_editado.iterrows():
             preco = float(row['Preço Unit.'])
             qtd = float(row['Qtde'])
-            desc_item = float(row.get('Desconto (%)', 0.0))
+            raw_desc = row.get('Desconto (%)', 0.0)
+            desc_item = 0.0 if pd.isna(raw_desc) else float(raw_desc)
+            desc_item = max(0.0, min(100.0, desc_item))
 
             novo_subtotal = (preco * qtd) * (1 - desc_item / 100)
             soma_subtotais += novo_subtotal
@@ -1248,8 +1250,8 @@ def recalcular_e_salvar_itens(cotacao_id, df_itens_editado, desconto_geral_atual
             supabase.table('cotacao_itens').update({
                 'desconto_percentual': desc_item,
                 'subtotal': novo_subtotal
-            }).eq('cotacao_id', cotacao_id).eq('codigo', row['Código']).execute()
-
+            }).eq('cotacao_id', cotacao_id).eq('codigo', str(row['Código']).strip()).execute()
+            
         total_final = soma_subtotais * (1 - desconto_geral_atual / 100)
 
         supabase.table('cotacoes').update({
@@ -1345,32 +1347,36 @@ def gerar_pdf_cotacao(cotacao_id, mostrar_precos=True, representante_id=None, cl
         pdf.ln(4)
         
         pdf.set_font('Arial', 'B', 10)
-        pdf.cell(25, 8, 'Cod.', border=1)
-        pdf.cell(75, 8, 'Produto', border=1)
-        pdf.cell(15, 8, 'Un.', border=1)
-        pdf.cell(15, 8, 'Qtd', border=1)
+        pdf.cell(22, 8, 'Cod.', border=1)
+        pdf.cell(66, 8, 'Produto', border=1)
+        pdf.cell(12, 8, 'Un.', border=1)
+        pdf.cell(14, 8, 'Qtd', border=1)
         
         if mostrar_precos:
-            pdf.cell(25, 8, 'Unit.', border=1)
+            pdf.cell(23, 8, 'Unit.', border=1)
+            pdf.cell(18, 8, 'Desc.', border=1)
             pdf.cell(30, 8, 'Subtotal', border=1, ln=True)
         else:
-            pdf.cell(55, 8, 'Precos a informar', border=1, ln=True)
+            pdf.cell(71, 8, 'Precos a informar', border=1, ln=True)
         
         pdf.set_font('Arial', '', 9)
         for item in itens:
-            pdf.cell(25, 6, str(item.get('codigo', ''))[:10], border=1)
-            pdf.cell(75, 6, str(item.get('produto', ''))[:35], border=1)
-            pdf.cell(15, 6, str(item.get('unidade', ''))[:5], border=1)
-            pdf.cell(15, 6, str(item.get('quantidade', '')), border=1)
+            pdf.cell(22, 6, str(item.get('codigo', ''))[:10], border=1)
+            pdf.cell(66, 6, str(item.get('produto', ''))[:32], border=1)
+            pdf.cell(12, 6, str(item.get('unidade', ''))[:5], border=1)
+            pdf.cell(14, 6, str(item.get('quantidade', '')), border=1)
             
             if mostrar_precos:
                 preco = float(item.get('preco_unitario', 0))
+                desc_item = float(item.get('desconto_percentual') or 0)
                 subtotal = float(item.get('subtotal', 0))
+                desc_txt = f"{desc_item:.1f}%" if desc_item > 0 else "-"
                 
-                pdf.cell(25, 6, f"{preco:.2f}", border=1)
+                pdf.cell(23, 6, f"{preco:.2f}", border=1)
+                pdf.cell(18, 6, desc_txt, border=1)
                 pdf.cell(30, 6, f"{subtotal:.2f}", border=1, ln=True)
             else:
-                pdf.cell(55, 6, '-', border=1, ln=True)
+                pdf.cell(71, 6, '-', border=1, ln=True)
         
         pdf.ln(5)
         pdf.set_font('Arial', 'I', 8)
@@ -2557,26 +2563,38 @@ def pagina_meus_pedidos(cliente):
                 else:
                     st.error(f"**Status:** {cot['status']}")
             
+            # Carrega itens antes do resumo para calcular valores com e sem desconto
+            itens = carregar_itens_cotacao(cot['id'])
+
             with col2:
                 # 3. Usamos a variável específica da cotação, não mais a geral
                 if mostrar_precos_nesta_cotacao:
                     try:
-                        total_orig = float(cot.get('total_original', 0))
+                        soma_subtotais = float(cot.get('total_original', 0))
                         desconto = float(cot.get('desconto_geral_percentual', 0))
                         total_final = float(cot.get('total_final', 0))
                     except (ValueError, TypeError):
-                        total_orig = total_final = 0
-                        desconto = 0
-                    
-                    st.write(f"**Total original:** R$ {total_orig:.2f}")
-                    if desconto > 0:
-                        st.write(f"**Desconto:** {desconto:.1f}%")
+                        soma_subtotais = total_final = 0.0
+                        desconto = 0.0
+
+                    if not itens.empty:
+                        total_bruto = float((itens['preco_unitario'].astype(float) * itens['quantidade'].astype(float)).sum())
+                    else:
+                        total_bruto = soma_subtotais
+
+                    desc_itens_reais = max(0.0, total_bruto - soma_subtotais)
+                    desc_pedido_reais = max(0.0, soma_subtotais - total_final)
+
+                    st.write(f"**Total bruto (sem descontos):** R$ {total_bruto:.2f}")
+                    if desc_itens_reais > 0.01:
+                        st.write(f"**Desconto nos itens:** - R$ {desc_itens_reais:.2f}")
+                    if desconto > 0 or desc_pedido_reais > 0.01:
+                        st.write(f"**Desconto no pedido ({desconto:.1f}%):** - R$ {desc_pedido_reais:.2f}")
                     st.write(f"**Total final:** R$ {total_final:.2f}")
                 else:
                     st.info("Aguardando aprovação do representante para exibir valores finais.")
 
             # Itens
-            itens = carregar_itens_cotacao(cot['id'])
             if not itens.empty:
                 st.markdown("**Itens:**")
                 
@@ -2584,10 +2602,17 @@ def pagina_meus_pedidos(cliente):
                 
                 # 4. Controla visualização na tabela de itens
                 if mostrar_precos_nesta_cotacao:
-                    df_show['preco_unitario'] = itens['preco_unitario']
-                    df_show['subtotal'] = itens['subtotal']
+                    df_show['preco_unitario'] = itens['preco_unitario'].apply(lambda x: f"R$ {float(x):.2f}")
+                    if 'desconto_percentual' in itens.columns:
+                        df_show['desconto_percentual'] = itens['desconto_percentual'].fillna(0.0).apply(
+                            lambda x: f"{float(x):.1f}%" if float(x) > 0 else "-"
+                        )
+                    else:
+                        df_show['desconto_percentual'] = "-"
+                    df_show['subtotal'] = itens['subtotal'].apply(lambda x: f"R$ {float(x):.2f}")
                 else:
                     df_show['preco_unitario'] = '-'
+                    df_show['desconto_percentual'] = '-'
                     df_show['subtotal'] = '-'
                 
                 df_show = df_show.rename(columns={
@@ -2595,10 +2620,11 @@ def pagina_meus_pedidos(cliente):
                     'produto': 'Produto',
                     'quantidade': 'Qtde',
                     'preco_unitario': 'Preço Unit.',
+                    'desconto_percentual': 'Desconto (%)',
                     'subtotal': 'Subtotal'
                 })
                 
-                st.dataframe(df_show, width='stretch')
+                st.dataframe(df_show, width='stretch', hide_index=True)
             
             st.caption(f"ℹ️ {AVISO_PRECOS_REFERENCIAIS}")
                       
